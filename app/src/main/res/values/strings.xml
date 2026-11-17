@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Nova</string>
+    <string name="accessibility_service_description">Nova Autonomous UI Navigator inspects visible screen elements and performs gestures only when you command an app action, with instant Volume-Down or voice kill switch.</string>
+    <string name="notification_listener_description">Nova local notification indexer reads incoming messages on-device to summarize unread alerts.</string>
+    <string name="voice_service_notification_title">Nova On-Device Assistant</string>
+    <string name="voice_service_notification_text">Process A active • Local AI Ready (0ms cold start)</string>
+    <string name="llm_service_notification_text">Process B (:llm) isolated inference runtime ready</string>
+</resources>

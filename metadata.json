@@ -1,0 +1,8 @@
+{
+  "name": "Nova",
+  "description": "On-device AI personal assistant with 4-tier local routing, FTS5 search, and autonomous UI navigation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
