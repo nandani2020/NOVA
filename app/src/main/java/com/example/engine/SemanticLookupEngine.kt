@@ -24,8 +24,8 @@ object SemanticLookupEngine {
 
     private val rawUtterances = mapOf(
         "device-hardware-control" to listOf(
-            "turn on flashlight torch wifi bluetooth do not disturb",
-            "set volume brightness mute unmute screen dark quiet"
+            "turn on turn off toggle flashlight torch wifi bluetooth do not disturb dnd",
+            "set volume brightness mute unmute silent vibrate display screen dark quiet"
         ),
         "clock-alarms-timers" to listOf(
             "set a timer countdown alarm wake me up snooze focus timer",
@@ -40,20 +40,20 @@ object SemanticLookupEngine {
             "search indexed files contacts notes local fts5"
         ),
         "personal-memory-vault" to listOf(
-            "remember I parked basement pillar locker code personal note",
-            "where did I park recall memory note saved fact"
+            "remember I parked basement pillar locker code personal note wifi",
+            "where did I park what is my locker code recall memory note saved fact"
         ),
         "messaging-omni-send" to listOf(
-            "summarize unread texts messages whatsapp sms reply send message",
-            "text contact unread notifications inbox"
+            "summarize unread texts messages important notifications whatsapp sms reply send message",
+            "text contact unread notifications inbox missed alerts"
         ),
         "phone-calls-manager" to listOf(
-            "call contact dial speakerphone answer decline missed calls",
-            "phone call voice call ring"
+            "call contact dial speakerphone answer call decline reject incoming call",
+            "phone call voice call ring hang up"
         ),
         "calendar-schedule-manager" to listOf(
-            "what is on my calendar schedule today meetings free slot",
-            "add calendar event schedule appointment tomorrow"
+            "what is on my calendar schedule today meetings free slot reminders",
+            "create reminder add calendar event schedule appointment tomorrow"
         ),
         "ui-autonomous-navigator" to listOf(
             "open app click tap order pay checkout confirm navigate third party app",
@@ -63,9 +63,14 @@ object SemanticLookupEngine {
             "what is on my screen summarize this page read screen translate",
             "explain current open app screen context"
         ),
+        "local-screen-control" to listOf(
+            "tap button click element type into search box scroll down scroll up screen control",
+            "automate app locally press play click search control screen"
+        ),
         "compound-routine-orchestrator" to listOf(
-            "good morning routine focus workflow sync apps",
-            "multi step combine search and send message"
+            "good morning routine focus mode bedtime routine sync phone apps",
+            "record routine floating control run recorded routine conditional if statement step delay",
+            "multi step combine search briefing timer dnd tap swipe automate routine"
         ),
         "app-knowledge-controller" to listOf(
             "what apps are installed on my phone list apps open app launch",
@@ -82,6 +87,10 @@ object SemanticLookupEngine {
         "alexa-utility-briefings" to listOf(
             "what time is it date battery level morning briefing daily summary",
             "add item to shopping list todo list read reminders"
+        ),
+        "general-knowledge-qa" to listOf(
+            "what is the highest mountain in the philippines capital of country population height facts trivia",
+            "who is who invented when did why does how tall define meaning explain science history geography"
         )
     )
 
@@ -110,10 +119,12 @@ object SemanticLookupEngine {
                 if (protoMap.isNotEmpty()) {
                     val scored = SkillCatalog.enabledSkills.map { skill ->
                         val protos = protoMap[skill.id].orEmpty()
-                        val best = protos.maxOfOrNull { v ->
+                        val neuralBest = protos.maxOfOrNull { v ->
                             EmbeddingGemmaRuntime.cosineSimilarity(queryVec, v)
-                        } ?: 0f
-                        skill to best.coerceIn(0f, 0.99f)
+                        }?.coerceIn(0f, 1f) ?: 0f
+                        val lexicalPrior = computeDomainBoost(query, skill)
+                        val blended = (neuralBest * 0.84f + lexicalPrior * 0.16f).coerceIn(0f, 0.99f)
+                        skill to blended
                     }.sortedByDescending { it.second }
                     return buildResult(query, scored, usedNeural = true)
                 }
@@ -122,17 +133,40 @@ object SemanticLookupEngine {
         return lookup(query)
     }
 
+    suspend fun warmPrototypes(embeddingRuntime: EmbeddingGemmaRuntime): Boolean {
+        if (!embeddingRuntime.isModelFilePresent()) return false
+        return getOrComputeNeuralPrototypes(embeddingRuntime).isNotEmpty()
+    }
+
+    fun buildCleanSkillPrototypes(skill: SkillSpec): List<String> {
+        val utterances = rawUtterances[skill.id].orEmpty()
+        val fewShotUtterances = skill.fewShotExamples
+            .map { it.substringBefore("->").trim() }
+            .filter { it.isNotBlank() && !it.startsWith("{") }
+        return (listOf(skill.description) + utterances + fewShotUtterances)
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+    }
+
     private suspend fun getOrComputeNeuralPrototypes(
         runtime: EmbeddingGemmaRuntime
     ): Map<String, List<FloatArray>> {
         cachedNeuralPrototypes?.let { if (it.isNotEmpty()) return it }
-        val built = mutableMapOf<String, List<FloatArray>>()
+
+        val flatRequests = mutableListOf<Pair<String, Pair<String, String>>>()
         for (skill in SkillCatalog.enabledSkills) {
-            val texts = rawUtterances[skill.id].orEmpty() + skill.fewShotExamples
-            val vecs = texts.mapNotNull { runtime.embedDocument(skill.title, it) }
-            if (vecs.isNotEmpty()) {
-                built[skill.id] = vecs
+            for (phrase in buildCleanSkillPrototypes(skill)) {
+                flatRequests.add(skill.id to (skill.title to phrase))
             }
+        }
+        if (flatRequests.isEmpty()) return emptyMap()
+
+        val batchVectors = runtime.embedDocumentsBatch(flatRequests.map { it.second })
+        val built = linkedMapOf<String, MutableList<FloatArray>>()
+        flatRequests.forEachIndexed { idx, (skillId, _) ->
+            val vec = batchVectors.getOrNull(idx) ?: return@forEachIndexed
+            built.getOrPut(skillId) { mutableListOf() }.add(vec)
         }
         if (built.isNotEmpty()) {
             cachedNeuralPrototypes = built
@@ -164,19 +198,22 @@ object SemanticLookupEngine {
     ): SemanticMatchResult {
         val topSkill = scored.firstOrNull()
         val topScore = topSkill?.second ?: 0f
+        val minCandidateThreshold = if (usedNeural) 0.24f else 0.28f
         val candidates = scored
-            .filter { it.second >= 0.28f }
+            .filter { it.second >= minCandidateThreshold }
             .take(3)
             .map { it.first }
             .ifEmpty { listOfNotNull(topSkill?.first) }
 
         val fewShots = candidates
-            .flatMap { it.fewShotExamples }
-            .take(3)
+            .flatMap { it.fewShotExamples.take(2) }
+            .distinct()
+            .take(5)
 
+        val directThreshold = if (usedNeural) 0.78f else 0.92f
         val isSingleStep = !InputNormalizer.normalize(query).hasConditionalLogic &&
             topSkill?.first?.requiresThinking == false &&
-            topScore >= 0.92f
+            topScore >= directThreshold
 
         return SemanticMatchResult(
             topScore = topScore,
@@ -191,28 +228,42 @@ object SemanticLookupEngine {
         val q = query.lowercase()
         val domainKeywords = when (skill.id) {
             "local-device-search" -> listOf("find", "pdf", "receipt", "flight", "bill", "password", "screenshot", "file", "search")
-            "personal-memory-vault" -> listOf("remember", "parked", "park", "code", "locker", "where did i")
-            "messaging-omni-send" -> listOf("text", "texts", "unread", "message", "messages", "summarize", "whatsapp", "sms", "reply")
+            "personal-memory-vault" -> listOf("remember", "parked", "park", "code", "locker", "where did i", "what is my", "recall")
+            "messaging-omni-send" -> listOf("text", "texts", "unread", "message", "messages", "notifications", "summarize", "whatsapp", "sms", "reply")
             "ui-autonomous-navigator" -> listOf("pay", "transfer", "order", "checkout", "open", "tap", "click", "scroll", "email")
-            "compound-routine-orchestrator" -> listOf("good morning", "morning", "bedtime", "routine", "and send", "then", "sync")
+            "compound-routine-orchestrator" -> listOf("good morning", "morning", "focus mode", "bedtime", "routine", "routines", "record routine", "floating", "conditional", "delay", "and send", "then", "sync")
             "clock-alarms-timers" -> listOf("timer", "alarm", "snooze", "minute", "minutes", "focus")
-            "device-hardware-control" -> listOf("flashlight", "torch", "wifi", "bluetooth", "volume", "brightness", "mute", "dnd")
-            "calendar-schedule-manager" -> listOf("calendar", "schedule", "meeting", "events", "free", "today")
-            "phone-calls-manager" -> listOf("call", "dial", "speakerphone", "missed", "contact", "contacts")
-            "media-playback-control" -> listOf("play", "music", "song", "spotify", "pause", "skip")
+            "device-hardware-control" -> listOf(
+                "flashlight", "torch", "wifi", "wi-fi", "bluetooth", "volume", "brightness",
+                "brighter", "dimmer", "mute", "unmute", "dnd", "do not disturb", "silent",
+                "vibrate", "display", "turn on", "turn off", "disable", "enable", "toggle"
+            )
+            "calendar-schedule-manager" -> listOf("calendar", "schedule", "meeting", "events", "reminder", "remind", "free", "today")
+            "phone-calls-manager" -> listOf("call", "dial", "speakerphone", "answer", "decline", "reject", "missed", "contact", "contacts")
+            "media-playback-control" -> listOf("play", "music", "song", "spotify", "pause", "skip", "resume", "track")
             "screen-context-assistant" -> listOf("screen", "page", "translate", "summarize this", "read this", "what is on")
+            "local-screen-control" -> listOf("tap", "click", "press", "type", "enter", "scroll", "swipe", "automate", "control")
             "app-knowledge-controller" -> listOf("apps", "installed", "launch", "open", "how to use", "which app", "what can")
-            "app-media-streaming" -> listOf("youtube music", "youtube", "spotify", "music", "song", "play", "playlist", "podcast", "video")
+            "app-media-streaming" -> listOf("youtube music", "yt music", "ytm", "youtube", "spotify", "music", "song", "play", "playlist", "podcast", "video")
             "app-search-and-action" -> listOf("search", "navigate", "directions", "maps", "waze", "chrome", "browser", "youtube")
             "alexa-utility-briefings" -> listOf("shopping", "todo", "list", "battery", "time", "date", "briefing", "morning")
+            "general-knowledge-qa" -> listOf("highest", "mountain", "capital", "country", "population", "invented", "define", "meaning", "history", "tallest", "largest", "who is", "who was", "what is the", "where is", "when did", "how tall", "how many")
             else -> emptyList()
         }
-        val hits = domainKeywords.count { q.contains(it) }
+        if (skill.id == "general-knowledge-qa" && WebKnowledgeResolver.isGeneralKnowledgeQuestion(query)) {
+            return 0.98f
+        }
+        val hits = domainKeywords.count { kw -> containsWholePhrase(q, kw) }
         return when {
             hits >= 2 -> 0.96f
             hits == 1 -> 0.72f
             else -> 0.1f
         }
+    }
+
+    private fun containsWholePhrase(text: String, phrase: String): Boolean {
+        val pattern = "\\b${Regex.escape(phrase)}\\b"
+        return Regex(pattern, RegexOption.IGNORE_CASE).containsMatchIn(text)
     }
 
     private fun lexicalEmbed(text: String): FloatArray {

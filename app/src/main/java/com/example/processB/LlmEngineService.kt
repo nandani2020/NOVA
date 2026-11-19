@@ -80,8 +80,14 @@ class LlmEngineService : Service() {
                     val uiTreeContext = msg.data.getString(KEY_UI_TREE_CONTEXT)
                     val appsContext = msg.data.getString(KEY_APPS_CONTEXT)
                     val recordedAccount = msg.data.getString(KEY_RECORDED_ACCOUNT)
+                    val memoryContext = msg.data.getString(KEY_MEMORY_CONTEXT)
+                    val personalityProfile = msg.data.getString(KEY_PERSONALITY_PROFILE)
                     val resetConversation = msg.data.getBoolean(KEY_RESET_CONVERSATION, false)
+                    val allowThinking = msg.data.getBoolean(KEY_ALLOW_THINKING, true)
 
+                    if (activeTurnJob?.isActive == true) {
+                        runtime.preemptBargeIn()
+                    }
                     activeTurnJob?.cancel()
                     activeTurnJob = scope.launch {
                         if (runtime.state.get() != LiteRtLmRuntimeWrapper.EngineState.READY) {
@@ -119,7 +125,10 @@ class LlmEngineService : Service() {
                                 uiTreeContext = uiTreeContext,
                                 installedAppsContext = appsContext,
                                 recordedAccount = recordedAccount,
-                                resetConversation = resetConversation
+                                memoryContext = memoryContext,
+                                personalityProfile = personalityProfile,
+                                resetConversation = resetConversation,
+                                allowThinking = allowThinking
                             )
                             val reply = Message.obtain(null, MSG_INFER_RESULT).apply {
                                 data = Bundle().apply {
@@ -134,16 +143,28 @@ class LlmEngineService : Service() {
                                 }
                             }
                             runCatching { replyTo?.send(reply) }
-                        } catch (ex: Exception) {
-                            Log.w(TAG, "Inference aborted/failed: ${ex.message}")
+                        } catch (ex: kotlinx.coroutines.CancellationException) {
+                            Log.i(TAG, "Inference cancelled: ${ex.message}")
                             val err = Message.obtain(null, MSG_INFER_ABORTED).apply {
                                 data = Bundle().apply {
                                     putString(KEY_REQUEST_ID, reqId)
-                                    putString(KEY_NOTE, ex.message ?: "Inference error")
+                                    putString(KEY_NOTE, ex.message ?: "Cancelled")
+                                    putBoolean(KEY_MODEL_MISSING, false)
+                                    putBoolean(KEY_IS_ERROR, false)
+                                }
+                            }
+                            runCatching { replyTo?.send(err) }
+                        } catch (ex: Exception) {
+                            Log.w(TAG, "Inference failed: ${ex.message}")
+                            val err = Message.obtain(null, MSG_INFER_ABORTED).apply {
+                                data = Bundle().apply {
+                                    putString(KEY_REQUEST_ID, reqId)
+                                    putString(KEY_NOTE, ex.message ?: "Local AI inference error")
                                     putBoolean(
                                         KEY_MODEL_MISSING,
                                         runtime.state.get() == LiteRtLmRuntimeWrapper.EngineState.MODEL_MISSING
                                     )
+                                    putBoolean(KEY_IS_ERROR, true)
                                 }
                             }
                             runCatching { replyTo?.send(err) }
@@ -230,7 +251,10 @@ class LlmEngineService : Service() {
         const val KEY_UI_TREE_CONTEXT = "ui_tree_context"
         const val KEY_APPS_CONTEXT = "apps_context"
         const val KEY_RECORDED_ACCOUNT = "recorded_account"
+        const val KEY_MEMORY_CONTEXT = "memory_context"
+        const val KEY_PERSONALITY_PROFILE = "personality_profile"
         const val KEY_RESET_CONVERSATION = "reset_conversation"
+        const val KEY_ALLOW_THINKING = "allow_thinking"
         const val KEY_PREFER_NPU = "prefer_npu"
         const val KEY_ACTIVE_BACKEND = "active_backend"
         const val KEY_MODEL_PATH = "model_path"
@@ -238,6 +262,7 @@ class LlmEngineService : Service() {
         const val KEY_STATE_NAME = "state_name"
         const val KEY_PID = "pid"
         const val KEY_MODEL_MISSING = "model_missing"
+        const val KEY_IS_ERROR = "is_error"
         const val KEY_NATIVE_HEAP_MB = "native_heap_mb"
         const val KEY_SELECTED_SKILL = "selected_skill"
         const val KEY_THINKING_ENABLED = "thinking_enabled"

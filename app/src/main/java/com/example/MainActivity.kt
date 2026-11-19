@@ -1,6 +1,7 @@
 package com.example
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.os.Build
@@ -42,7 +43,9 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        val openVoice = intent?.getBooleanExtra("open_voice_overlay", false) == true
+        val openVoice = intent?.getBooleanExtra("open_voice_overlay", false) == true ||
+            intent?.action == Intent.ACTION_ASSIST
+        viewModel.handleLaunchIntent(intent)
 
         setContent {
             NovaTheme {
@@ -52,6 +55,23 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        viewModel.handleLaunchIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.setAppInForeground(true)
+        viewModel.refreshOsAccessStatus()
+    }
+
+    override fun onPause() {
+        viewModel.setAppInForeground(false)
+        super.onPause()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {

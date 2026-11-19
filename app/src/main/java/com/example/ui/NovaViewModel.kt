@@ -1,24 +1,33 @@
 package com.example.ui
 
+import android.Manifest
 import android.app.Application
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Debug
 import android.os.IBinder
 import android.os.Process
+import androidx.core.content.ContextCompat
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.data.AgenticMemoryEntry
+import com.example.data.AsrEngineOption
+import com.example.data.AssistantPersonality
 import com.example.data.ControlIconType
 import com.example.data.DeviceAccountHelper
 import com.example.data.DeviceActionExecutor
 import com.example.data.HubCategory
+import com.example.data.InstalledModelInfo
+import com.example.data.LearnedProcessRecord
 import com.example.data.LlmModelManager
 import com.example.data.LlmModelPreset
 import com.example.data.LocalFtsIndexHelper
@@ -28,18 +37,34 @@ import com.example.data.ModelSlot
 import com.example.data.OrbVisualMode
 import com.example.data.PipelineStepPill
 import com.example.data.ProcessHealthState
+import com.example.data.RecordedRoutine
+import com.example.data.RecordedRoutineStore
+import com.example.data.RoutineRecorderState
+import com.example.data.RoutineScope
 import com.example.data.RoutingTier
 import com.example.data.SmartControlItem
 import com.example.data.StepStatus
+import com.example.data.SystemTtsEngineInfo
+import com.example.data.SystemTtsVoiceInfo
 import com.example.data.TierRedConfirmation
+import com.example.data.TtsEngineOption
+import com.example.data.TurnExecutionOutcome
+import com.example.data.WakeWordStatus
+import com.example.engine.AgenticMemoryEngine
+import com.example.engine.AppCapabilityRegistry
+import com.example.engine.ImportantNotificationFilter.ImportantNotificationAlert
+import com.example.engine.ImportantNotificationFilter.ImportantNotificationType
 import com.example.engine.NovaPipelineRouter
+import com.example.engine.RoutineExecutionEngine
 import com.example.engine.SemanticLookupEngine
 import com.example.processA.EmbeddingGemmaRuntime
 import com.example.processA.LlmProcessBridge
 import com.example.processA.NovaAccessibilityService
 import com.example.processA.NovaNotificationListenerService
 import com.example.processA.NovaVoiceForegroundService
+import com.example.processA.RoutineRecorderManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -63,7 +88,12 @@ data class VoiceOverlayUiState(
     val lastRoutingTier: RoutingTier? = null,
     val lastLatencyMs: Long? = null,
     val isSpeakingTts: Boolean = false,
-    val requiresModelSetup: Boolean = false
+    val requiresModelSetup: Boolean = false,
+    val requiresAccessibilitySetup: Boolean = false,
+    val isAwaitingFollowUp: Boolean = false,
+    val followUpListenTrigger: Long = 0L,
+    val followUpCancelTrigger: Long = 0L,
+    val useServiceFollowUpMic: Boolean = false
 )
 
 data class NovaUiState(
@@ -76,12 +106,29 @@ data class NovaUiState(
     val pendingConfirmation: TierRedConfirmation? = null,
     val processHealth: ProcessHealthState = ProcessHealthState(),
     val llmPreset: LlmModelPreset? = null,
+    val llmPresets: List<LlmModelPreset> = emptyList(),
     val embeddingPreset: LlmModelPreset? = null,
+    val asrPresets: List<LlmModelPreset> = emptyList(),
+    val ttsPresets: List<LlmModelPreset> = emptyList(),
+    val installedModelsBySlot: Map<ModelSlot, List<InstalledModelInfo>> = emptyMap(),
+    val availableTtsEngines: List<SystemTtsEngineInfo> = emptyList(),
+    val availableTtsVoices: List<SystemTtsVoiceInfo> = emptyList(),
     val downloadState: ModelDownloadState = ModelDownloadState.Idle,
     val ftsSearchQuery: String = "",
     val ftsSearchResults: List<LocalIndexDocument> = emptyList(),
     val showSettingsScreen: Boolean = false,
-    val statusToast: String? = null
+    val statusToast: String? = null,
+    val openVoiceTrigger: Long = 0L,
+    val autoListenOnOverlay: Boolean = false,
+    val activeNotificationPrompt: ImportantNotificationAlert? = null,
+    val recordedRoutines: List<RecordedRoutine> = emptyList(),
+    val recorderState: RoutineRecorderState = RoutineRecorderState(),
+    val editingRoutine: RecordedRoutine? = null,
+    val installedAppsForRoutines: List<AppCapabilityRegistry.InstalledAppProfile> = emptyList(),
+    val showHiddenReadme: Boolean = false,
+    val assistantPersonality: AssistantPersonality = AssistantPersonality.WARM_COMPANION,
+    val agenticMemories: List<AgenticMemoryEntry> = emptyList(),
+    val learnedProcesses: List<LearnedProcessRecord> = emptyList()
 )
 
 private fun defaultControls(): List<SmartControlItem> = listOf(
@@ -220,6 +267,7 @@ private fun defaultControls(): List<SmartControlItem> = listOf(
 class NovaViewModel(application: Application) : AndroidViewModel(application) {
 
     private val ftsHelper = LocalFtsIndexHelper(application)
+    private val routineStore = RecordedRoutineStore(application)
     private val accountHelper = DeviceAccountHelper(application)
     val modelManager = LlmModelManager(application)
     private val embeddingRuntime = EmbeddingGemmaRuntime(application, modelManager)
@@ -229,15 +277,30 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         NovaUiState(
             recordedAccount = accountHelper.getOrDetectSystemAccount(),
             llmPreset = modelManager.llmPreset,
-            embeddingPreset = modelManager.embeddingPreset
+            llmPresets = modelManager.llmPresets,
+            embeddingPreset = modelManager.embeddingPreset,
+            asrPresets = modelManager.asrPresets,
+            ttsPresets = modelManager.ttsPresets,
+            recordedRoutines = routineStore.getAll()
         )
     )
     val uiState: StateFlow<NovaUiState> = _uiState.asStateFlow()
+
+    private val agenticMemoryEngine = AgenticMemoryEngine(
+        ftsHelper = ftsHelper,
+        embeddingRuntime = embeddingRuntime,
+        personalityProvider = { _uiState.value.assistantPersonality },
+        userNameProvider = { _uiState.value.userName },
+        onPersonalityChanged = { mode -> setAssistantPersonality(mode) },
+        onUserNameChanged = { newName -> updateUserName(newName) }
+    )
 
     private val executor = DeviceActionExecutor(
         context = application,
         ftsHelper = ftsHelper,
         embeddingRuntime = embeddingRuntime,
+        routineStore = routineStore,
+        agenticMemoryEngine = agenticMemoryEngine,
         onControlUpdated = { id, enabled, value, mode ->
             applyControlPatch(id, enabled, value, mode)
         }
@@ -248,25 +311,52 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         executor = executor,
         embeddingRuntime = embeddingRuntime,
         accountHelper = accountHelper,
+        agenticMemoryEngine = agenticMemoryEngine,
         onAccountRecorded = { saved ->
             _uiState.update { it.copy(recordedAccount = saved) }
         }
     )
 
     private var activeTurnJob: Job? = null
+    private var followUpJob: Job? = null
+    private var followUpFallbackJob: Job? = null
+    private var followUpListenWindowMs: Long = FOLLOW_UP_TIMEOUT_MS
     private var downloadJob: Job? = null
     private var voiceService: NovaVoiceForegroundService? = null
     private var isVoiceServiceBound = false
+    private var isAppInForeground = true
+    private var isVoiceOverlayOpen = false
+    @Volatile
+    private var speechGenerationId = 0L
+    @Volatile
+    private var pendingPauseWakeTarget: Boolean? = null
+    internal var testSpeakDispatcher: ((String, () -> Unit) -> Boolean)? = null
+    internal var testServiceFollowUpDispatcher: ((Long, (String) -> Unit) -> Boolean)? = null
 
     private val fgsConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as? NovaVoiceForegroundService.LocalBinder
             voiceService = binder?.getService()
             isVoiceServiceBound = true
-            applyWakeWordServiceBinding(_uiState.value.processHealth.wakeWordEnabled)
+            val health = _uiState.value.processHealth
+            voiceService?.setProactiveNotificationPromptsEnabled(health.proactiveNotificationPrompts)
+            voiceService?.setPauseWakeDuringMedia(health.pauseWakeDuringMedia)
+            voiceService?.setAsrEngineOption(health.asrEngine)
+            voiceService?.configureTts(
+                enginePackage = health.selectedSystemTtsEnginePkg,
+                voiceName = health.selectedSystemTtsVoiceName,
+                speechRate = health.ttsSpeechRate,
+                pitch = health.ttsPitch
+            )
+            voiceService?.setBargeInCallback { decision ->
+                handleVoiceBargeInDecision(decision)
+            }
+            applyWakeWordServiceBinding(health.wakeWordEnabled)
+            refreshInstalledModelsAndVoices()
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            voiceService?.setBargeInCallback(null)
             voiceService = null
             isVoiceServiceBound = false
         }
@@ -274,6 +364,7 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         refreshFtsQuery("")
+        refreshAgenticLearningState()
 
         // Sync live hardware toggles (Bluetooth, Wi-Fi, DND, Media Volume) from real OS APIs
         val hwSnap = executor.readLiveHardwareSnapshot()
@@ -285,18 +376,41 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         // Bind Process B (:llm) isolated inference runtime
         llmBridge.bindToLlmProcess()
 
-        // Warm up EmbeddingGemma 2 & ensure installed apps/capabilities are indexed
-        viewModelScope.launch {
+        // Warm up EmbeddingGemma 2, pre-warm skill prototypes, refresh apps/tags, and backfill any null vectors
+        viewModelScope.launch(Dispatchers.IO) {
             if (embeddingRuntime.isModelFilePresent()) {
-                embeddingRuntime.warmup()
+                if (embeddingRuntime.warmup()) {
+                    SemanticLookupEngine.warmPrototypes(embeddingRuntime)
+                }
             }
-            if (ftsHelper.countDocuments("apps") == 0) {
-                com.example.engine.AppCapabilityRegistry.syncInstalledAppsWithCapabilities(
-                    getApplication(),
-                    ftsHelper,
-                    embeddingRuntime
+            val discovered = AppCapabilityRegistry.syncInstalledAppsWithCapabilities(
+                getApplication(),
+                ftsHelper,
+                embeddingRuntime
+            )
+            _uiState.update {
+                it.copy(
+                    installedAppsForRoutines = AppCapabilityRegistry.discoverInstalledApps(getApplication()).take(40)
                 )
-                refreshFtsQuery(_uiState.value.ftsSearchQuery)
+            }
+            if (embeddingRuntime.isReady.value) {
+                ftsHelper.backfillMissingEmbeddings(embeddingRuntime)
+            }
+            refreshFtsQuery(_uiState.value.ftsSearchQuery)
+        }
+
+        // Observe recorded routines & live floating recorder state
+        viewModelScope.launch {
+            routineStore.routines.collect { list ->
+                _uiState.update { it.copy(recordedRoutines = list) }
+            }
+        }
+        viewModelScope.launch {
+            RoutineRecorderManager.state.collect { rec ->
+                if (!rec.isRecording && rec.lastStatusMessage.startsWith("Saved '")) {
+                    routineStore.reload()
+                }
+                _uiState.update { it.copy(recorderState = rec) }
             }
         }
 
@@ -310,28 +424,119 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
 
-        // Load persisted preferences (display name, wake-word toggle, NPU preference)
+        // Load persisted preferences (display name, personality, wake-word, media protection, ASR/TTS engines & voice)
         viewModelScope.launch {
             application.novaDataStore.data
                 .map { prefs ->
-                    Triple(
-                        prefs[KEY_USER_NAME] ?: "NOVA USER",
-                        prefs[KEY_WAKE_WORD] ?: false,
-                        prefs[KEY_PREFER_NPU] ?: false
+                    val micGranted = ContextCompat.checkSelfPermission(
+                        application,
+                        Manifest.permission.RECORD_AUDIO
+                    ) == PackageManager.PERMISSION_GRANTED
+                    val explicitWake = prefs[KEY_WAKE_WORD]
+                    val wakeEnabled = explicitWake ?: micGranted
+                    val persona = AssistantPersonality.fromIdOrName(prefs[KEY_PERSONALITY])
+                        ?: AssistantPersonality.WARM_COMPANION
+                    PrefSnapshot(
+                        userName = prefs[KEY_USER_NAME] ?: "NOVA USER",
+                        wakeEnabled = wakeEnabled,
+                        preferNpu = prefs[KEY_PREFER_NPU] ?: false,
+                        proactiveNotifPrompts = prefs[KEY_PROACTIVE_NOTIF_PROMPTS] ?: true,
+                        thinkingEnabled = prefs[KEY_THINKING_ENABLED] ?: true,
+                        personality = persona,
+                        pauseWakeDuringMedia = prefs[KEY_PAUSE_WAKE_DURING_MEDIA] ?: false,
+                        asrEngine = AsrEngineOption.fromId(prefs[KEY_ASR_ENGINE]),
+                        ttsEngine = TtsEngineOption.fromId(prefs[KEY_TTS_ENGINE]),
+                        systemTtsEnginePkg = prefs[KEY_SYSTEM_TTS_ENGINE_PKG] ?: "",
+                        systemTtsVoiceName = prefs[KEY_SYSTEM_TTS_VOICE_NAME] ?: "",
+                        ttsSpeechRate = (prefs[KEY_TTS_SPEECH_RATE] ?: 1.0f).coerceIn(0.6f, 1.8f),
+                        ttsPitch = (prefs[KEY_TTS_PITCH] ?: 1.0f).coerceIn(0.6f, 1.5f)
                     )
                 }
-                .collect { (name, wakeEnabled, preferNpu) ->
+                .collect { snap ->
+                    val effectivePauseWake = pendingPauseWakeTarget?.let { pending ->
+                        if (snap.pauseWakeDuringMedia == pending) {
+                            pendingPauseWakeTarget = null
+                        }
+                        pending
+                    } ?: snap.pauseWakeDuringMedia
                     _uiState.update {
                         it.copy(
-                            userName = name,
+                            userName = snap.userName,
+                            assistantPersonality = snap.personality,
                             processHealth = it.processHealth.copy(
-                                wakeWordEnabled = wakeEnabled,
-                                preferNpuBackend = preferNpu
+                                wakeWordEnabled = snap.wakeEnabled,
+                                preferNpuBackend = snap.preferNpu,
+                                proactiveNotificationPrompts = snap.proactiveNotifPrompts,
+                                thinkingEnabled = snap.thinkingEnabled,
+                                assistantPersonality = snap.personality,
+                                pauseWakeDuringMedia = effectivePauseWake,
+                                asrEngine = snap.asrEngine,
+                                ttsEngine = snap.ttsEngine,
+                                selectedSystemTtsEnginePkg = snap.systemTtsEnginePkg,
+                                selectedSystemTtsVoiceName = snap.systemTtsVoiceName,
+                                ttsSpeechRate = snap.ttsSpeechRate,
+                                ttsPitch = snap.ttsPitch
                             )
                         )
                     }
-                    applyWakeWordServiceBinding(wakeEnabled)
+                    voiceService?.setProactiveNotificationPromptsEnabled(snap.proactiveNotifPrompts)
+                    voiceService?.setPauseWakeDuringMedia(effectivePauseWake)
+                    voiceService?.setAsrEngineOption(snap.asrEngine)
+                    voiceService?.configureTts(
+                        enginePackage = snap.systemTtsEnginePkg,
+                        voiceName = snap.systemTtsVoiceName,
+                        speechRate = snap.ttsSpeechRate,
+                        pitch = snap.ttsPitch
+                    )
+                    applyWakeWordServiceBinding(snap.wakeEnabled)
                 }
+        }
+
+        // Observe live external media playback state so UI reflects PAUSED_FOR_MEDIA cleanly
+        viewModelScope.launch {
+            NovaVoiceForegroundService.externalMediaPlaying.collect { playing ->
+                _uiState.update { cur ->
+                    cur.copy(
+                        processHealth = cur.processHealth.copy(externalMediaPlaying = playing)
+                    )
+                }
+            }
+        }
+
+        // Observe personalized "Hey Nova" wake-voice calibration progress and learned phonetic aliases
+        viewModelScope.launch {
+            NovaVoiceForegroundService.wakeCalibrationSamples.collect { samples ->
+                _uiState.update { cur ->
+                    cur.copy(
+                        processHealth = cur.processHealth.copy(wakeCalibrationSamples = samples)
+                    )
+                }
+            }
+        }
+        viewModelScope.launch {
+            NovaVoiceForegroundService.wakeCalibrationAliases.collect { aliases ->
+                _uiState.update { cur ->
+                    cur.copy(
+                        processHealth = cur.processHealth.copy(wakeCalibrationAliases = aliases)
+                    )
+                }
+            }
+        }
+
+        // Collect real-time important notifications (Messages, Missed Calls, Reminders) for proactive visual prompting
+        viewModelScope.launch {
+            NovaNotificationListenerService.incomingImportantAlerts.collect { alert ->
+                val unreadNow = ftsHelper.countUnreadNotifications()
+                _uiState.update { cur ->
+                    val showPrompt = cur.processHealth.proactiveNotificationPrompts
+                    cur.copy(
+                        activeNotificationPrompt = if (showPrompt) alert else cur.activeNotificationPrompt,
+                        processHealth = cur.processHealth.copy(
+                            unreadMessagesCount = unreadNow
+                        )
+                    )
+                }
+            }
         }
 
         // Register hardware Volume-Down / accessibility kill switch listener
@@ -352,18 +557,24 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
                 llmBridge.state,
                 embeddingRuntime.isReady,
                 NovaAccessibilityService.isConnected,
-                NovaNotificationListenerService.isConnected
-            ) { bridge, embReady, accConnected, notifConnected ->
-                TelemetrySnapshot(bridge, embReady, accConnected, notifConnected)
-            }.collect { (bridge, embReady, accConnected, notifConnected) ->
+                NovaNotificationListenerService.isConnected,
+                NovaVoiceForegroundService.wakeWordStatus
+            ) { bridge, embReady, accConnected, notifConnected, wakeStatus ->
+                TelemetrySnapshot(bridge, embReady, accConnected, notifConnected, wakeStatus)
+            }.collect { (bridge, embReady, accConnected, notifConnected, wakeStatus) ->
                 val runtime = Runtime.getRuntime()
                 val jvmUsedMb = (runtime.totalMemory() - runtime.freeMemory()) / (1024L * 1024L)
                 val nativeUsedMb = Debug.getNativeHeapAllocatedSize() / (1024L * 1024L)
                 val totalProcAMb = (jvmUsedMb + nativeUsedMb).toInt()
                 val embFile = modelManager.getActiveModelFile(ModelSlot.EMBEDDING)
+                val asrFile = modelManager.getActiveModelFile(ModelSlot.ASR)
+                val ttsFile = modelManager.getActiveModelFile(ModelSlot.TTS)
+                val installedBySlot = ModelSlot.entries.associateWith { modelManager.listInstalledModels(it) }
 
+                val (agenticMemCount, learnedProcCount) = ftsHelper.getAgenticMemoryCounts()
                 _uiState.update { cur ->
                     cur.copy(
+                        installedModelsBySlot = installedBySlot,
                         processHealth = cur.processHealth.copy(
                             processAStatus = "ACTIVE",
                             processAPid = Process.myPid(),
@@ -378,13 +589,23 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
                             embeddingPresent = embFile != null,
                             embeddingReady = embReady,
                             activeEmbeddingName = embFile?.name,
-                            activeEmbeddingSizeMb = (embFile?.length() ?: 0L) / (1024L * 1024L),
+                            activeEmbeddingSizeMb = modelManager.getActiveModelSizeBytes(ModelSlot.EMBEDDING) / (1024L * 1024L),
+                            asrModelPresent = asrFile != null,
+                            activeAsrModelName = asrFile?.name,
+                            activeAsrModelSizeMb = modelManager.getActiveModelSizeBytes(ModelSlot.ASR) / (1024L * 1024L),
+                            ttsModelPresent = ttsFile != null,
+                            activeTtsModelName = ttsFile?.name,
+                            activeTtsModelSizeMb = modelManager.getActiveModelSizeBytes(ModelSlot.TTS) / (1024L * 1024L),
                             respawnCount = bridge.respawnCount,
                             ftsMode = ftsHelper.activeFtsMode,
                             indexedDocCount = ftsHelper.countDocuments(),
-                            unreadMessagesCount = ftsHelper.countDocuments("messages"),
+                            unreadMessagesCount = ftsHelper.countUnreadNotifications(),
                             accessibilityConnected = accConnected,
-                            notificationListenerConnected = notifConnected
+                            notificationListenerConnected = notifConnected ||
+                                NovaNotificationListenerService.isPermissionGranted(getApplication()),
+                            wakeWordStatus = wakeStatus,
+                            agenticMemoryCount = agenticMemCount,
+                            learnedProcessCount = learnedProcCount
                         )
                     )
                 }
@@ -392,25 +613,281 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private data class PrefSnapshot(
+        val userName: String,
+        val wakeEnabled: Boolean,
+        val preferNpu: Boolean,
+        val proactiveNotifPrompts: Boolean,
+        val thinkingEnabled: Boolean,
+        val personality: AssistantPersonality,
+        val pauseWakeDuringMedia: Boolean,
+        val asrEngine: AsrEngineOption,
+        val ttsEngine: TtsEngineOption,
+        val systemTtsEnginePkg: String,
+        val systemTtsVoiceName: String,
+        val ttsSpeechRate: Float,
+        val ttsPitch: Float
+    )
+
     private data class TelemetrySnapshot(
         val bridge: LlmProcessBridge.BridgeState,
         val embReady: Boolean,
         val accConnected: Boolean,
-        val notifConnected: Boolean
+        val notifConnected: Boolean,
+        val wakeStatus: WakeWordStatus
     )
 
     private fun applyWakeWordServiceBinding(enabled: Boolean) {
         voiceService?.setWakeWordListening(enabled) { command ->
             if (command.isNotBlank()) {
+                _uiState.update {
+                    it.copy(
+                        showSettingsScreen = false,
+                        openVoiceTrigger = System.currentTimeMillis(),
+                        autoListenOnOverlay = false
+                    )
+                }
                 submitCommand(command, speakResponse = true)
+            } else {
+                // Bare "Hey Nova": open Voice Overlay and immediately begin active command listening (10s window)
+                voiceService?.setOverlayListeningPaused(true)
+                _uiState.update {
+                    it.copy(
+                        showSettingsScreen = false,
+                        openVoiceTrigger = System.currentTimeMillis(),
+                        autoListenOnOverlay = false
+                    )
+                }
+                startFollowUpListenWindow(
+                    speakOnTimeout = true,
+                    headerOverride = "HEY NOVA • LISTENING"
+                )
+                _uiState.update {
+                    it.copy(
+                        voiceState = it.voiceState.copy(
+                            transcript = "",
+                            stepPills = emptyList(),
+                            assistantResponse = "I'm listening — go ahead with your command.",
+                            requiresModelSetup = false,
+                            requiresAccessibilitySetup = false
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    fun handleLaunchIntent(intent: Intent?) {
+        if (intent == null) return
+        val isAssist = intent.action == Intent.ACTION_ASSIST ||
+            intent.getBooleanExtra("open_voice_overlay", false)
+        if (!isAssist) return
+
+        val wakeCommand = intent.getStringExtra("wake_command")?.trim().orEmpty()
+        val autoListen = intent.getBooleanExtra("auto_listen", wakeCommand.isEmpty())
+        _uiState.update {
+            it.copy(
+                showSettingsScreen = false,
+                openVoiceTrigger = System.currentTimeMillis(),
+                autoListenOnOverlay = false
+            )
+        }
+        if (wakeCommand.isNotEmpty()) {
+            submitCommand(wakeCommand, speakResponse = true)
+        } else if (autoListen) {
+            voiceService?.setOverlayListeningPaused(true)
+            startFollowUpListenWindow(
+                speakOnTimeout = true,
+                headerOverride = "HEY NOVA • LISTENING"
+            )
+        }
+    }
+
+    fun consumeAutoListen() {
+        _uiState.update { it.copy(autoListenOnOverlay = false) }
+    }
+
+    fun onMicPermissionGranted() {
+        val app = getApplication<Application>()
+        NovaVoiceForegroundService.start(app)
+        viewModelScope.launch {
+            var shouldAutoEnable = false
+            app.novaDataStore.edit { prefs ->
+                if (prefs[KEY_WAKE_WORD] == null) {
+                    prefs[KEY_WAKE_WORD] = true
+                    shouldAutoEnable = true
+                } else if (prefs[KEY_WAKE_WORD] == true) {
+                    shouldAutoEnable = true
+                }
+            }
+            if (shouldAutoEnable) {
+                applyWakeWordServiceBinding(true)
             }
         }
     }
 
     fun setWakeWordEnabled(enabled: Boolean) {
+        val app = getApplication<Application>()
+        if (enabled) {
+            NovaVoiceForegroundService.start(app)
+        }
+        viewModelScope.launch {
+            app.novaDataStore.edit { prefs ->
+                prefs[KEY_WAKE_WORD] = enabled
+            }
+            applyWakeWordServiceBinding(enabled)
+        }
+    }
+
+    fun recordWakeCalibrationSample() {
+        val app = getApplication<Application>()
+        if (_uiState.value.processHealth.isCalibratingWakeVoice) return
+        NovaVoiceForegroundService.start(app)
+        if (!isVoiceServiceBound) {
+            runCatching {
+                app.bindService(
+                    Intent(app, NovaVoiceForegroundService::class.java),
+                    fgsConnection,
+                    Context.BIND_AUTO_CREATE
+                )
+            }
+        }
+        viewModelScope.launch {
+            var waited = 0L
+            while (voiceService == null && waited < 1_500L) {
+                kotlinx.coroutines.delay(100L)
+                waited += 100L
+            }
+            val svc = voiceService
+            if (svc == null) {
+                showStatusToast("Voice service is warming up — tap Record Sample again in a moment.")
+                return@launch
+            }
+            _uiState.update { cur ->
+                cur.copy(processHealth = cur.processHealth.copy(isCalibratingWakeVoice = true))
+            }
+            showStatusToast("Listening... Say \"Hey Nova\" clearly in your normal voice.")
+            svc.captureWakeCalibrationSample(
+                onComplete = { sampleCount, learnedAliases, heardPrimary ->
+                    _uiState.update { cur ->
+                        cur.copy(
+                            processHealth = cur.processHealth.copy(
+                                isCalibratingWakeVoice = false,
+                                wakeCalibrationSamples = sampleCount,
+                                wakeCalibrationAliases = learnedAliases
+                            )
+                        )
+                    }
+                    val progressText = if (sampleCount >= 3) {
+                        "Voice calibration complete (3/3)! Heard \"$heardPrimary\"."
+                    } else {
+                        "Sample $sampleCount/3 saved (heard \"$heardPrimary\"). Tap again for ${3 - sampleCount} more."
+                    }
+                    showStatusToast(progressText)
+                },
+                onError = { message ->
+                    _uiState.update { cur ->
+                        cur.copy(processHealth = cur.processHealth.copy(isCalibratingWakeVoice = false))
+                    }
+                    showStatusToast(message)
+                }
+            )
+        }
+    }
+
+    fun resetWakeVoiceCalibration() {
+        voiceService?.clearWakeVoiceCalibration()
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(
+                    isCalibratingWakeVoice = false,
+                    wakeCalibrationSamples = 0,
+                    wakeCalibrationAliases = emptyList()
+                )
+            )
+        }
+        showStatusToast("Cleared personalized 'Hey Nova' voice calibration.")
+    }
+
+    fun setProactiveNotificationPrompts(enabled: Boolean) {
+        voiceService?.setProactiveNotificationPromptsEnabled(enabled)
         viewModelScope.launch {
             getApplication<Application>().novaDataStore.edit { prefs ->
-                prefs[KEY_WAKE_WORD] = enabled
+                prefs[KEY_PROACTIVE_NOTIF_PROMPTS] = enabled
+            }
+            if (!enabled) {
+                _uiState.update { it.copy(activeNotificationPrompt = null) }
+            }
+        }
+    }
+
+    fun dismissNotificationPrompt() {
+        _uiState.update { it.copy(activeNotificationPrompt = null) }
+    }
+
+    fun setHiddenReadmeVisible(visible: Boolean) {
+        if (visible && _uiState.value.installedAppsForRoutines.isEmpty()) {
+            val apps = runCatching {
+                AppCapabilityRegistry.discoverInstalledApps(getApplication()).take(60)
+            }.getOrDefault(emptyList())
+            _uiState.update {
+                it.copy(
+                    showHiddenReadme = true,
+                    installedAppsForRoutines = apps
+                )
+            }
+        } else {
+            _uiState.update { it.copy(showHiddenReadme = visible) }
+        }
+    }
+
+    fun readActiveNotificationAloud() {
+        val alert = _uiState.value.activeNotificationPrompt ?: return
+        ftsHelper.markNotificationsRead(listOf(alert.id))
+        val unreadNow = ftsHelper.countUnreadNotifications()
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(unreadMessagesCount = unreadNow),
+                voiceState = cur.voiceState.copy(isSpeakingTts = true)
+            )
+        }
+        val spoke = dispatchTtsSpeech(alert.spokenPrompt) {
+            _uiState.update { cur ->
+                cur.copy(voiceState = cur.voiceState.copy(isSpeakingTts = false))
+            }
+        }
+        if (!spoke) {
+            _uiState.update { cur ->
+                cur.copy(voiceState = cur.voiceState.copy(isSpeakingTts = false))
+            }
+        }
+    }
+
+    fun actOnNotificationPrompt(alert: ImportantNotificationAlert) {
+        ftsHelper.markNotificationsRead(listOf(alert.id))
+        val unreadNow = ftsHelper.countUnreadNotifications()
+        _uiState.update {
+            it.copy(
+                activeNotificationPrompt = null,
+                processHealth = it.processHealth.copy(unreadMessagesCount = unreadNow)
+            )
+        }
+        when (alert.type) {
+            ImportantNotificationType.MISSED_CALL -> {
+                val caller = alert.title
+                    .replace(Regex("missed call(?: from)?", RegexOption.IGNORE_CASE), "")
+                    .trim()
+                    .ifEmpty { alert.body }
+                if (caller.isNotBlank()) {
+                    submitCommand("call $caller", speakResponse = true)
+                } else {
+                    NovaNotificationListenerService.openNotificationAlert(getApplication(), alert)
+                }
+            }
+            ImportantNotificationType.MESSAGE,
+            ImportantNotificationType.REMINDER,
+            ImportantNotificationType.GENERAL -> {
+                NovaNotificationListenerService.openNotificationAlert(getApplication(), alert)
             }
         }
     }
@@ -432,6 +909,24 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setThinkingEnabled(enabled: Boolean) {
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(thinkingEnabled = enabled),
+                statusToast = if (enabled) {
+                    "Thinking mode ON — deeper reasoning enabled"
+                } else {
+                    "Thinking mode OFF — faster direct responses"
+                }
+            )
+        }
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_THINKING_ENABLED] = enabled
+            }
+        }
+    }
+
     fun selectCategory(category: HubCategory) {
         _uiState.update { it.copy(selectedCategory = category) }
     }
@@ -446,16 +941,287 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun refreshOsAccessStatus() {
+        val app = getApplication<Application>()
+        val accActive = NovaAccessibilityService.instance != null ||
+            NovaAccessibilityService.isServiceEnabledInSystem(app)
+        val notifActive = NovaNotificationListenerService.isConnected.value ||
+            NovaNotificationListenerService.isPermissionGranted(app)
+        if (notifActive) {
+            NovaNotificationListenerService.requestRebindIfNeeded(app)
+        }
+        if (_uiState.value.processHealth.wakeWordEnabled) {
+            applyWakeWordServiceBinding(true)
+        }
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(
+                    accessibilityConnected = accActive,
+                    notificationListenerConnected = notifActive
+                )
+            )
+        }
+    }
+
     fun setSettingsVisible(visible: Boolean) {
         if (visible) {
             llmBridge.refreshPresenceOnly()
+            refreshOsAccessStatus()
             refreshFtsQuery(_uiState.value.ftsSearchQuery)
+            refreshAgenticLearningState()
+            refreshInstalledModelsAndVoices()
         }
         _uiState.update { it.copy(showSettingsScreen = visible) }
     }
 
+    fun setPauseWakeDuringMedia(enabled: Boolean) {
+        pendingPauseWakeTarget = enabled
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(pauseWakeDuringMedia = enabled),
+                statusToast = if (enabled) {
+                    "Wake word will pause automatically during music playback"
+                } else {
+                    "Concurrent voice enabled: say 'Hey Nova' or tap mic while music plays"
+                }
+            )
+        }
+        voiceService?.setPauseWakeDuringMedia(enabled)
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_PAUSE_WAKE_DURING_MEDIA] = enabled
+            }
+        }
+    }
+
+    fun selectAsrEngine(option: AsrEngineOption) {
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(asrEngine = option),
+                statusToast = "ASR Engine: ${option.displayName}"
+            )
+        }
+        voiceService?.setAsrEngineOption(option)
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_ASR_ENGINE] = option.id
+            }
+        }
+    }
+
+    fun selectTtsEngine(option: TtsEngineOption) {
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(ttsEngine = option),
+                statusToast = "TTS Mode: ${option.displayName}"
+            )
+        }
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_TTS_ENGINE] = option.id
+            }
+        }
+    }
+
+    fun selectSystemTtsEngine(packageName: String) {
+        val clean = packageName.trim()
+        val health = _uiState.value.processHealth
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(
+                    selectedSystemTtsEnginePkg = clean,
+                    selectedSystemTtsVoiceName = ""
+                ),
+                statusToast = if (clean.isEmpty()) "Using Android default TTS engine" else "Switched TTS engine to $clean"
+            )
+        }
+        voiceService?.configureTts(
+            enginePackage = clean,
+            voiceName = "",
+            speechRate = health.ttsSpeechRate,
+            pitch = health.ttsPitch
+        )
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_SYSTEM_TTS_ENGINE_PKG] = clean
+                prefs[KEY_SYSTEM_TTS_VOICE_NAME] = ""
+            }
+            kotlinx.coroutines.delay(500L)
+            refreshInstalledModelsAndVoices()
+        }
+    }
+
+    fun selectSystemTtsVoice(voiceName: String) {
+        val clean = voiceName.trim()
+        val health = _uiState.value.processHealth
+        _uiState.update { cur ->
+            cur.copy(
+                processHealth = cur.processHealth.copy(selectedSystemTtsVoiceName = clean),
+                statusToast = if (clean.isEmpty()) "Using default voice" else "Selected voice: $clean"
+            )
+        }
+        voiceService?.configureTts(
+            enginePackage = health.selectedSystemTtsEnginePkg,
+            voiceName = clean,
+            speechRate = health.ttsSpeechRate,
+            pitch = health.ttsPitch
+        )
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_SYSTEM_TTS_VOICE_NAME] = clean
+            }
+        }
+    }
+
+    fun setTtsSpeechRate(rate: Float) {
+        val clamped = rate.coerceIn(0.6f, 1.8f)
+        val health = _uiState.value.processHealth
+        _uiState.update { cur ->
+            cur.copy(processHealth = cur.processHealth.copy(ttsSpeechRate = clamped))
+        }
+        voiceService?.configureTts(
+            enginePackage = health.selectedSystemTtsEnginePkg,
+            voiceName = health.selectedSystemTtsVoiceName,
+            speechRate = clamped,
+            pitch = health.ttsPitch
+        )
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_TTS_SPEECH_RATE] = clamped
+            }
+        }
+    }
+
+    fun setTtsPitch(pitch: Float) {
+        val clamped = pitch.coerceIn(0.6f, 1.5f)
+        val health = _uiState.value.processHealth
+        _uiState.update { cur ->
+            cur.copy(processHealth = cur.processHealth.copy(ttsPitch = clamped))
+        }
+        voiceService?.configureTts(
+            enginePackage = health.selectedSystemTtsEnginePkg,
+            voiceName = health.selectedSystemTtsVoiceName,
+            speechRate = health.ttsSpeechRate,
+            pitch = clamped
+        )
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_TTS_PITCH] = clamped
+            }
+        }
+    }
+
+    fun testSpeakVoice() {
+        val spoke = voiceService?.speakTestSample(
+            "Hi! I'm Nova. Your voice and music playback settings are active."
+        ) == true
+        if (!spoke) {
+            _uiState.update { it.copy(statusToast = "TTS engine is initializing — try Test Voice again in a moment.") }
+        }
+    }
+
+    fun refreshInstalledModelsAndVoices() {
+        val installed = ModelSlot.entries.associateWith { modelManager.listInstalledModels(it) }
+        val embFile = modelManager.getActiveModelFile(ModelSlot.EMBEDDING)
+        val asrFile = modelManager.getActiveModelFile(ModelSlot.ASR)
+        val ttsFile = modelManager.getActiveModelFile(ModelSlot.TTS)
+        val engines = voiceService?.getAvailableSystemTtsEngines().orEmpty()
+        val voices = voiceService?.getAvailableSystemTtsVoices().orEmpty()
+        _uiState.update { cur ->
+            cur.copy(
+                installedModelsBySlot = installed,
+                availableTtsEngines = engines,
+                availableTtsVoices = voices,
+                processHealth = cur.processHealth.copy(
+                    embeddingPresent = embFile != null,
+                    activeEmbeddingName = embFile?.name,
+                    activeEmbeddingSizeMb = modelManager.getActiveModelSizeBytes(ModelSlot.EMBEDDING) / (1024L * 1024L),
+                    asrModelPresent = asrFile != null,
+                    activeAsrModelName = asrFile?.name,
+                    activeAsrModelSizeMb = modelManager.getActiveModelSizeBytes(ModelSlot.ASR) / (1024L * 1024L),
+                    ttsModelPresent = ttsFile != null,
+                    activeTtsModelName = ttsFile?.name,
+                    activeTtsModelSizeMb = modelManager.getActiveModelSizeBytes(ModelSlot.TTS) / (1024L * 1024L)
+                )
+            )
+        }
+    }
+
+    fun setAssistantPersonality(personality: AssistantPersonality) {
+        _uiState.update { cur ->
+            cur.copy(
+                assistantPersonality = personality,
+                processHealth = cur.processHealth.copy(assistantPersonality = personality),
+                statusToast = "Personality: ${personality.displayName}"
+            )
+        }
+        viewModelScope.launch {
+            getApplication<Application>().novaDataStore.edit { prefs ->
+                prefs[KEY_PERSONALITY] = personality.name
+            }
+        }
+        refreshAgenticLearningState()
+    }
+
+    fun refreshAgenticLearningState() {
+        val memories = ftsHelper.getAgenticMemories(limit = 20)
+        val processes = ftsHelper.getLearnedProcesses(limit = 12)
+        val (memCount, procCount) = ftsHelper.getAgenticMemoryCounts()
+        _uiState.update { cur ->
+            cur.copy(
+                agenticMemories = memories,
+                learnedProcesses = processes,
+                processHealth = cur.processHealth.copy(
+                    agenticMemoryCount = memCount,
+                    learnedProcessCount = procCount
+                )
+            )
+        }
+    }
+
+    fun deleteAgenticMemory(memoryId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            ftsHelper.deleteAgenticMemory(memoryId)
+            refreshAgenticLearningState()
+            _uiState.update { it.copy(statusToast = "Removed learned memory") }
+        }
+    }
+
+    fun deleteLearnedProcess(processId: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            ftsHelper.deleteLearnedProcess(processId)
+            refreshAgenticLearningState()
+            _uiState.update { it.copy(statusToast = "Removed learned process") }
+        }
+    }
+
+    fun deleteLearnedProcessStep(processId: String, stepIndex: Int) {
+        viewModelScope.launch(Dispatchers.IO) {
+            ftsHelper.deleteLearnedProcessStep(processId, stepIndex)
+            refreshAgenticLearningState()
+            _uiState.update { it.copy(statusToast = "Removed step from learned process") }
+        }
+    }
+
+    fun clearAllAgenticLearning() {
+        viewModelScope.launch(Dispatchers.IO) {
+            ftsHelper.clearAllAgenticLearning()
+            refreshAgenticLearningState()
+            _uiState.update { it.copy(statusToast = "Cleared all agentic learning & habits") }
+        }
+    }
+
+    fun runLearnedProcess(process: LearnedProcessRecord) {
+        viewModelScope.launch {
+            val outcome = router.executeLearnedProcessSteps(process)
+            refreshAgenticLearningState()
+            _uiState.update { it.copy(statusToast = outcome.responseText) }
+        }
+    }
+
     fun updateUserName(newName: String) {
         val clean = newName.trim().uppercase().take(24).ifEmpty { "NOVA USER" }
+        _uiState.update { it.copy(userName = clean) }
         viewModelScope.launch {
             getApplication<Application>().novaDataStore.edit { prefs ->
                 prefs[KEY_USER_NAME] = clean
@@ -499,21 +1265,7 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         downloadJob = viewModelScope.launch {
             val result = modelManager.downloadModel(slot, url, fileName, bearerToken)
             result.onSuccess { file ->
-                if (slot == ModelSlot.LLM) {
-                    llmBridge.reloadModelInProcessB(_uiState.value.processHealth.preferNpuBackend)
-                    _uiState.update {
-                        it.copy(statusToast = "Downloaded ${file.name}. Initializing Gemma 4 :llm...")
-                    }
-                } else {
-                    SemanticLookupEngine.invalidateNeuralCache()
-                    val ok = embeddingRuntime.warmup()
-                    _uiState.update {
-                        it.copy(
-                            statusToast = if (ok) "Downloaded & loaded EmbeddingGemma (${file.name})."
-                            else "Downloaded ${file.name}. Warmup failed: ${embeddingRuntime.lastError.value}"
-                        )
-                    }
-                }
+                onModelInstalledOrChanged(slot, file.name, isImport = false)
             }.onFailure { ex ->
                 _uiState.update {
                     it.copy(statusToast = ex.message ?: "Model download failed")
@@ -531,21 +1283,7 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val result = modelManager.importLocalModel(slot, uri, displayName)
             result.onSuccess { file ->
-                if (slot == ModelSlot.LLM) {
-                    llmBridge.reloadModelInProcessB(_uiState.value.processHealth.preferNpuBackend)
-                    _uiState.update {
-                        it.copy(statusToast = "Imported ${file.name}. Loading into :llm...")
-                    }
-                } else {
-                    SemanticLookupEngine.invalidateNeuralCache()
-                    val ok = embeddingRuntime.warmup()
-                    _uiState.update {
-                        it.copy(
-                            statusToast = if (ok) "Imported & loaded EmbeddingGemma (${file.name})."
-                            else "Imported ${file.name}."
-                        )
-                    }
-                }
+                onModelInstalledOrChanged(slot, file.name, isImport = true)
             }.onFailure { ex ->
                 _uiState.update {
                     it.copy(statusToast = ex.message ?: "Model import failed")
@@ -554,35 +1292,153 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun deleteInstalledModel(slot: ModelSlot) {
-        viewModelScope.launch {
-            if (slot == ModelSlot.LLM) {
-                llmBridge.unloadModelInProcessB()
-                modelManager.deleteActiveModel(ModelSlot.LLM)
-                llmBridge.refreshPresenceOnly()
-                _uiState.update { it.copy(statusToast = "Gemma 4 E2B model removed.") }
-            } else {
-                embeddingRuntime.unload()
+    private suspend fun onModelInstalledOrChanged(slot: ModelSlot, fileName: String, isImport: Boolean) {
+        val verb = if (isImport) "Imported" else "Downloaded"
+        refreshInstalledModelsAndVoices()
+        when (slot) {
+            ModelSlot.LLM -> {
+                llmBridge.reloadModelInProcessB(_uiState.value.processHealth.preferNpuBackend)
+                _uiState.update {
+                    it.copy(statusToast = "$verb $fileName. Initializing Gemma 4 :llm...")
+                }
+            }
+            ModelSlot.EMBEDDING -> {
                 SemanticLookupEngine.invalidateNeuralCache()
-                modelManager.deleteActiveModel(ModelSlot.EMBEDDING)
-                _uiState.update { it.copy(statusToast = "EmbeddingGemma 2 model removed.") }
+                val ok = embeddingRuntime.warmup()
+                if (ok) {
+                    viewModelScope.launch(Dispatchers.IO) {
+                        SemanticLookupEngine.warmPrototypes(embeddingRuntime)
+                        ftsHelper.backfillMissingEmbeddings(embeddingRuntime)
+                    }
+                }
+                _uiState.update {
+                    it.copy(
+                        statusToast = if (ok) "$verb & loaded EmbeddingGemma ($fileName)."
+                        else "$verb $fileName. Warmup: ${embeddingRuntime.lastError.value ?: "pending"}"
+                    )
+                }
+            }
+            ModelSlot.ASR -> {
+                selectAsrEngine(AsrEngineOption.LOCAL_ASR_MODEL)
+                _uiState.update {
+                    it.copy(statusToast = "$verb ASR model '$fileName' and set active.")
+                }
+            }
+            ModelSlot.TTS -> {
+                val lower = fileName.lowercase()
+                val preferredMode = when {
+                    lower.contains("kokoro") -> TtsEngineOption.KOKORO_ONNX
+                    lower.contains("piper") || lower.contains("vits") -> TtsEngineOption.PIPER_VITS
+                    else -> TtsEngineOption.LOCAL_TTS_BUNDLE
+                }
+                selectTtsEngine(preferredMode)
+                _uiState.update {
+                    it.copy(statusToast = "$verb TTS model '$fileName' and set active.")
+                }
             }
         }
     }
 
-    fun reloadModel(slot: ModelSlot) {
-        if (slot == ModelSlot.LLM) {
-            llmBridge.reloadModelInProcessB(_uiState.value.processHealth.preferNpuBackend)
-        } else {
-            viewModelScope.launch {
+    fun selectInstalledModel(slot: ModelSlot, fileName: String) {
+        viewModelScope.launch {
+            if (!modelManager.setActiveModel(slot, fileName)) {
+                _uiState.update { it.copy(statusToast = "Could not activate $fileName") }
+                return@launch
+            }
+            refreshInstalledModelsAndVoices()
+            when (slot) {
+                ModelSlot.LLM -> {
+                    llmBridge.reloadModelInProcessB(_uiState.value.processHealth.preferNpuBackend)
+                    _uiState.update { it.copy(statusToast = "Switched LLM to $fileName") }
+                }
+                ModelSlot.EMBEDDING -> {
+                    SemanticLookupEngine.invalidateNeuralCache()
+                    embeddingRuntime.warmup()
+                    _uiState.update { it.copy(statusToast = "Switched Embedding model to $fileName") }
+                }
+                ModelSlot.ASR -> {
+                    selectAsrEngine(AsrEngineOption.LOCAL_ASR_MODEL)
+                    _uiState.update { it.copy(statusToast = "Active ASR model: $fileName") }
+                }
+                ModelSlot.TTS -> {
+                    val lower = fileName.lowercase()
+                    val mode = when {
+                        lower.contains("kokoro") -> TtsEngineOption.KOKORO_ONNX
+                        lower.contains("piper") || lower.contains("vits") -> TtsEngineOption.PIPER_VITS
+                        else -> TtsEngineOption.LOCAL_TTS_BUNDLE
+                    }
+                    selectTtsEngine(mode)
+                    _uiState.update { it.copy(statusToast = "Active TTS model: $fileName") }
+                }
+            }
+        }
+    }
+
+    fun deleteSpecificModel(slot: ModelSlot, fileName: String) {
+        viewModelScope.launch {
+            val wasActive = modelManager.getActiveModelFile(slot)?.name == fileName
+            modelManager.deleteModel(slot, fileName)
+            if (wasActive && slot == ModelSlot.LLM) {
+                llmBridge.unloadModelInProcessB()
+                llmBridge.refreshPresenceOnly()
+            } else if (wasActive && slot == ModelSlot.EMBEDDING) {
+                embeddingRuntime.unload()
                 SemanticLookupEngine.invalidateNeuralCache()
-                embeddingRuntime.warmup()
+            }
+            refreshInstalledModelsAndVoices()
+            _uiState.update { it.copy(statusToast = "Removed $fileName") }
+        }
+    }
+
+    fun deleteInstalledModel(slot: ModelSlot) {
+        viewModelScope.launch {
+            when (slot) {
+                ModelSlot.LLM -> {
+                    llmBridge.unloadModelInProcessB()
+                    modelManager.deleteActiveModel(ModelSlot.LLM)
+                    llmBridge.refreshPresenceOnly()
+                    _uiState.update { it.copy(statusToast = "Gemma 4 E2B model removed.") }
+                }
+                ModelSlot.EMBEDDING -> {
+                    embeddingRuntime.unload()
+                    SemanticLookupEngine.invalidateNeuralCache()
+                    modelManager.deleteActiveModel(ModelSlot.EMBEDDING)
+                    _uiState.update { it.copy(statusToast = "EmbeddingGemma 2 model removed.") }
+                }
+                ModelSlot.ASR -> {
+                    modelManager.deleteActiveModel(ModelSlot.ASR)
+                    _uiState.update { it.copy(statusToast = "Installed ASR models removed.") }
+                }
+                ModelSlot.TTS -> {
+                    modelManager.deleteActiveModel(ModelSlot.TTS)
+                    _uiState.update { it.copy(statusToast = "Installed TTS models removed.") }
+                }
+            }
+            refreshInstalledModelsAndVoices()
+        }
+    }
+
+    fun reloadModel(slot: ModelSlot) {
+        when (slot) {
+            ModelSlot.LLM -> llmBridge.reloadModelInProcessB(_uiState.value.processHealth.preferNpuBackend)
+            ModelSlot.EMBEDDING -> {
+                viewModelScope.launch(Dispatchers.IO) {
+                    SemanticLookupEngine.invalidateNeuralCache()
+                    if (embeddingRuntime.warmup()) {
+                        SemanticLookupEngine.warmPrototypes(embeddingRuntime)
+                        ftsHelper.backfillMissingEmbeddings(embeddingRuntime)
+                    }
+                }
+            }
+            ModelSlot.ASR, ModelSlot.TTS -> {
+                refreshInstalledModelsAndVoices()
+                _uiState.update { it.copy(statusToast = "Refreshed ${slot.name} model list.") }
             }
         }
     }
 
     fun syncInstalledAppsToFts() {
-        viewModelScope.launch {
+        viewModelScope.launch(Dispatchers.IO) {
             val count = com.example.engine.AppCapabilityRegistry.syncInstalledAppsWithCapabilities(
                 getApplication(),
                 ftsHelper,
@@ -596,24 +1452,28 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun syncContactsToFts() {
-        val count = ftsHelper.syncContacts(getApplication())
-        refreshFtsQuery(_uiState.value.ftsSearchQuery)
-        _uiState.update {
-            it.copy(
-                statusToast = if (count >= 0) "Indexed $count contacts into ${ftsHelper.activeFtsMode}"
-                else "READ_CONTACTS permission required to sync contacts."
-            )
+        viewModelScope.launch(Dispatchers.IO) {
+            val count = ftsHelper.syncContactsWithEmbeddings(getApplication(), embeddingRuntime)
+            refreshFtsQuery(_uiState.value.ftsSearchQuery)
+            _uiState.update {
+                it.copy(
+                    statusToast = if (count >= 0) "Indexed $count contacts into ${ftsHelper.activeFtsMode}"
+                    else "READ_CONTACTS permission required to sync contacts."
+                )
+            }
         }
     }
 
     fun syncCalendarToFts() {
-        val count = ftsHelper.syncCalendarEvents(getApplication())
-        refreshFtsQuery(_uiState.value.ftsSearchQuery)
-        _uiState.update {
-            it.copy(
-                statusToast = if (count >= 0) "Indexed $count calendar events into ${ftsHelper.activeFtsMode}"
-                else "READ_CALENDAR permission required to sync calendar."
-            )
+        viewModelScope.launch(Dispatchers.IO) {
+            val count = ftsHelper.syncCalendarEventsWithEmbeddings(getApplication(), embeddingRuntime)
+            refreshFtsQuery(_uiState.value.ftsSearchQuery)
+            _uiState.update {
+                it.copy(
+                    statusToast = if (count >= 0) "Indexed $count calendar events into ${ftsHelper.activeFtsMode}"
+                    else "READ_CALENDAR permission required to sync calendar."
+                )
+            }
         }
     }
 
@@ -730,19 +1590,45 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
 
     fun setVoiceListening(listening: Boolean, amplitude: Float = 0.4f) {
         if (listening) {
+            voiceService?.beginConcurrentMicSession()
+            voiceService?.setOverlayListeningPaused(true)
             voiceService?.stopSpeakingImmediate()
             llmBridge.sendBargeInAbort()
-        }
-        _uiState.update { state ->
-            state.copy(
-                voiceState = state.voiceState.copy(
-                    isListening = listening,
-                    statusHeader = if (listening) "LISTENING..." else "SAY SOMETHING",
-                    orbMode = if (listening) OrbVisualMode.LISTENING else OrbVisualMode.IDLE,
-                    amplitude = amplitude,
-                    isSpeakingTts = false
+            _uiState.update { state ->
+                state.copy(
+                    voiceState = state.voiceState.copy(
+                        isListening = true,
+                        statusHeader = "LISTENING...",
+                        orbMode = OrbVisualMode.LISTENING,
+                        amplitude = amplitude,
+                        isSpeakingTts = false
+                    )
                 )
-            )
+            }
+        } else {
+            val cur = _uiState.value.voiceState
+            val busyWithTurnOrTts = activeTurnJob?.isActive == true ||
+                cur.isSpeakingTts ||
+                cur.isAwaitingFollowUp ||
+                (voiceService?.isCurrentlySpeaking() == true)
+            if (!busyWithTurnOrTts) {
+                voiceService?.setOverlayListeningPaused(false)
+                voiceService?.endConcurrentMicSession(resumeInterruptedMediaIfNeeded = false)
+            }
+            _uiState.update { state ->
+                val vs = state.voiceState
+                val keepCurrentStatus = activeTurnJob?.isActive == true ||
+                    vs.isSpeakingTts ||
+                    vs.isAwaitingFollowUp
+                state.copy(
+                    voiceState = vs.copy(
+                        isListening = false,
+                        statusHeader = if (keepCurrentStatus) vs.statusHeader else "SAY SOMETHING",
+                        orbMode = if (keepCurrentStatus) vs.orbMode else OrbVisualMode.IDLE,
+                        amplitude = amplitude
+                    )
+                )
+            }
         }
     }
 
@@ -751,6 +1637,16 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
             state.copy(
                 voiceState = state.voiceState.copy(
                     transcript = partial,
+                    amplitude = rmsAmplitude.coerceIn(0.15f, 1.0f)
+                )
+            )
+        }
+    }
+
+    fun updateVoiceAmplitude(rmsAmplitude: Float) {
+        _uiState.update { state ->
+            state.copy(
+                voiceState = state.voiceState.copy(
                     amplitude = rmsAmplitude.coerceIn(0.15f, 1.0f)
                 )
             )
@@ -780,6 +1676,29 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
+        val activeAlert = _uiState.value.activeNotificationPrompt
+        if (activeAlert != null) {
+            val lower = query.lowercase()
+            when {
+                lower == "read it" || lower == "read notification" -> {
+                    readActiveNotificationAloud()
+                    return
+                }
+                lower == "open it" || lower == "open notification" -> {
+                    actOnNotificationPrompt(activeAlert)
+                    return
+                }
+                lower == "call back" && activeAlert.type == ImportantNotificationType.MISSED_CALL -> {
+                    actOnNotificationPrompt(activeAlert)
+                    return
+                }
+                lower == "dismiss" || lower == "dismiss notification" || lower == "ignore" -> {
+                    dismissNotificationPrompt()
+                    return
+                }
+            }
+        }
+
         val pending = _uiState.value.pendingConfirmation
         if (pending != null) {
             val lower = query.lowercase()
@@ -792,11 +1711,16 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
             }
         }
 
+        cancelFollowUpWindow()
         activeTurnJob?.cancel()
+        speechGenerationId++
+        voiceService?.stopFollowUpCapture()
+        voiceService?.setOverlayListeningPaused(true)
         voiceService?.stopSpeakingImmediate()
         NovaAccessibilityService.resetKillSwitch()
 
         activeTurnJob = viewModelScope.launch {
+            val turnSpeechGen = speechGenerationId
             _uiState.update { state ->
                 state.copy(
                     voiceState = state.voiceState.copy(
@@ -806,13 +1730,17 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
                         orbMode = OrbVisualMode.LISTENING,
                         stepPills = emptyList(),
                         assistantResponse = "",
-                        requiresModelSetup = false
+                        requiresModelSetup = false,
+                        requiresAccessibilitySetup = false,
+                        isAwaitingFollowUp = false,
+                        isSpeakingTts = false
                     )
                 )
             }
 
             try {
-                val outcome = router.routeAndExecute(query) { pills, orbMode, header ->
+                val thinkingAllowed = _uiState.value.processHealth.thinkingEnabled
+                val outcome = router.routeAndExecute(query, thinkingAllowed = thinkingAllowed) { pills, orbMode, header ->
                     _uiState.update { state ->
                         state.copy(
                             voiceState = state.voiceState.copy(
@@ -825,16 +1753,47 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
 
+                val expectsAnswer = NovaPipelineRouter.shouldAwaitFollowUp(
+                    outcome = outcome,
+                    hasPendingChoices = router.getPendingChoices().size > 1
+                )
+                val startedMediaPlayback = isMediaPlaybackStartOutcome(outcome, expectsAnswer)
+                if (startedMediaPlayback) {
+                    voiceService?.notifyMediaPlaybackStarted(graceWindowMs = 5_000L)
+                }
+                val spokenText = outcome.pendingConfirmation?.summary ?: outcome.responseText
+                val shouldSpeakTurn = speakResponse && !startedMediaPlayback && spokenText.isNotBlank()
+                val willAttemptTts = shouldSpeakTurn &&
+                    (testSpeakDispatcher != null || voiceService != null)
+
+                val (memCountNow, procCountNow) = ftsHelper.getAgenticMemoryCounts()
+                val memoriesNow = ftsHelper.getAgenticMemories(limit = 20)
+                val processesNow = ftsHelper.getLearnedProcesses(limit = 12)
+
                 _uiState.update { state ->
                     state.copy(
                         pendingConfirmation = outcome.pendingConfirmation,
+                        agenticMemories = memoriesNow,
+                        learnedProcesses = processesNow,
                         processHealth = state.processHealth.copy(
-                            indexedDocCount = ftsHelper.countDocuments()
+                            indexedDocCount = ftsHelper.countDocuments(),
+                            unreadMessagesCount = ftsHelper.countUnreadNotifications(),
+                            agenticMemoryCount = memCountNow,
+                            learnedProcessCount = procCountNow
                         ),
                         voiceState = state.voiceState.copy(
                             statusHeader = when {
                                 outcome.requiresModelSetup -> "LLM MODEL MISSING"
                                 outcome.pendingConfirmation != null -> "CONFIRMATION REQUIRED"
+                                startedMediaPlayback ->
+                                    if (state.processHealth.pauseWakeDuringMedia) {
+                                        "PLAYING MEDIA • MIC PAUSED"
+                                    } else {
+                                        "PLAYING MEDIA • SAY HEY NOVA OR TAP MIC"
+                                    }
+                                expectsAnswer && willAttemptTts -> "SPEAKING • TAP OR SAY STOP"
+                                expectsAnswer -> "ASKING YOU..."
+                                willAttemptTts -> "SPEAKING • TAP OR SAY STOP"
                                 else -> outcome.routingTier.badge
                             },
                             orbMode = outcome.orbMode,
@@ -842,24 +1801,500 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
                             assistantResponse = outcome.responseText,
                             lastRoutingTier = outcome.routingTier,
                             lastLatencyMs = outcome.latencyMs,
-                            isSpeakingTts = speakResponse && outcome.pendingConfirmation == null,
-                            requiresModelSetup = outcome.requiresModelSetup
+                            isListening = false,
+                            isAwaitingFollowUp = false,
+                            isSpeakingTts = willAttemptTts && outcome.pendingConfirmation == null,
+                            requiresModelSetup = outcome.requiresModelSetup,
+                            requiresAccessibilitySetup = outcome.requiresAccessibilitySetup
                         ),
-                        statusToast = if (outcome.routingTier == RoutingTier.TIER_1_REGEX) {
+                        statusToast = if (outcome.routingTier == RoutingTier.TIER_1_REGEX || startedMediaPlayback) {
                             "${outcome.routingTier.badge} • ${outcome.responseText}"
                         } else null
                     )
                 }
 
-                if (speakResponse) {
-                    voiceService?.speak(
-                        outcome.pendingConfirmation?.summary ?: outcome.responseText
-                    )
+                if (expectsAnswer) {
+                    val triggered = java.util.concurrent.atomic.AtomicBoolean(false)
+                    fun triggerListenOnce() {
+                        if (speechGenerationId == turnSpeechGen && triggered.compareAndSet(false, true)) {
+                            followUpFallbackJob?.cancel()
+                            startFollowUpListenWindow(speakOnTimeout = speakResponse)
+                        }
+                    }
+
+                    val spoke = if (shouldSpeakTurn) {
+                        dispatchTtsSpeech(spokenText) { triggerListenOnce() }
+                    } else {
+                        false
+                    }
+
+                    if (spoke) {
+                        followUpFallbackJob?.cancel()
+                        followUpFallbackJob = viewModelScope.launch {
+                            // Safety ceiling only in case TTS engine callback hangs; never cut off live TTS early
+                            val maxWaitMs = (spokenText.length * 140L + 4000L).coerceIn(8_000L, 45_000L)
+                            kotlinx.coroutines.delay(maxWaitMs)
+                            var extraWaits = 0
+                            while (voiceService?.isCurrentlySpeaking() == true && extraWaits < 30) {
+                                kotlinx.coroutines.delay(500L)
+                                extraWaits++
+                            }
+                            triggerListenOnce()
+                        }
+                    } else {
+                        triggerListenOnce()
+                    }
+                } else if (shouldSpeakTurn) {
+                    val spoke = dispatchTtsSpeech(spokenText) {
+                        if (speechGenerationId == turnSpeechGen) {
+                            onTurnTtsCompleted()
+                        }
+                    }
+                    if (!spoke) {
+                        onTurnTtsCompleted()
+                    }
+                } else {
+                    onTurnTtsCompleted()
                 }
             } catch (_: CancellationException) {
-                // Handled gracefully by killSwitchAbort
+                if (speechGenerationId == turnSpeechGen) {
+                    _uiState.update { cur ->
+                        val vs = cur.voiceState
+                        val stillWorking = vs.statusHeader in setOf("ROUTING...", "THINKING...", "WORKING...", "CHECKING SCREEN...", "LISTENING...")
+                        cur.copy(
+                            voiceState = vs.copy(
+                                statusHeader = if (stillWorking) "STANDING BY" else vs.statusHeader,
+                                orbMode = if (stillWorking) OrbVisualMode.IDLE else vs.orbMode,
+                                isListening = false,
+                                isAwaitingFollowUp = false,
+                                isSpeakingTts = false
+                            )
+                        )
+                    }
+                    onTurnTtsCompleted()
+                }
+            } catch (ex: Exception) {
+                if (speechGenerationId == turnSpeechGen) {
+                    val safeMsg = ex.message?.takeIf { it.isNotBlank() && it.length < 180 }
+                        ?: "Something went wrong while handling that request. Please try again."
+                    _uiState.update { cur ->
+                        cur.copy(
+                            voiceState = cur.voiceState.copy(
+                                statusHeader = "TRY AGAIN",
+                                orbMode = OrbVisualMode.ERROR_ABORTED,
+                                assistantResponse = safeMsg,
+                                isListening = false,
+                                isAwaitingFollowUp = false,
+                                isSpeakingTts = false
+                            ),
+                            statusToast = safeMsg
+                        )
+                    }
+                    onTurnTtsCompleted()
+                }
             }
         }
+    }
+
+    private fun dispatchTtsSpeech(text: String, onDone: () -> Unit): Boolean {
+        val custom = testSpeakDispatcher
+        if (custom != null) {
+            return custom.invoke(text, onDone)
+        }
+        return voiceService?.speak(text, onDone) == true
+    }
+
+    private fun resumeWakeWordIfIdle() {
+        val vs = _uiState.value.voiceState
+        val busyWithAudio = vs.isListening ||
+            vs.isAwaitingFollowUp ||
+            vs.isSpeakingTts ||
+            activeTurnJob?.isActive == true ||
+            voiceService?.isCurrentlySpeaking() == true
+        if (!busyWithAudio) {
+            voiceService?.setOverlayListeningPaused(false)
+            voiceService?.ensureWakeLoopActiveIfIdle()
+        }
+    }
+
+    private fun onTurnTtsCompleted() {
+        _uiState.update { cur ->
+            val vs = cur.voiceState
+            val nextHeader = if (!vs.isAwaitingFollowUp && vs.statusHeader.startsWith("SPEAKING")) {
+                vs.lastRoutingTier?.badge ?: "STANDING BY"
+            } else {
+                vs.statusHeader
+            }
+            if (!vs.isSpeakingTts && nextHeader == vs.statusHeader) cur
+            else cur.copy(
+                voiceState = vs.copy(
+                    isSpeakingTts = false,
+                    statusHeader = nextHeader
+                )
+            )
+        }
+        if (!_uiState.value.voiceState.statusHeader.startsWith("PLAYING MEDIA")) {
+            voiceService?.endConcurrentMicSession(resumeInterruptedMediaIfNeeded = true)
+        }
+        resumeWakeWordIfIdle()
+    }
+
+    internal fun setFollowUpTimeoutForTest(timeoutMs: Long) {
+        followUpListenWindowMs = timeoutMs.coerceAtLeast(10L)
+    }
+
+    fun setAppInForeground(inForeground: Boolean) {
+        isAppInForeground = inForeground
+        if (!inForeground) {
+            val vs = _uiState.value.voiceState
+            if (vs.isAwaitingFollowUp && !vs.isSpeakingTts && !vs.useServiceFollowUpMic) {
+                _uiState.update { cur ->
+                    cur.copy(voiceState = cur.voiceState.copy(useServiceFollowUpMic = true))
+                }
+                startServiceFollowUpCapture()
+            }
+        } else {
+            resumeWakeWordIfIdle()
+        }
+    }
+
+    fun setVoiceOverlayOpen(open: Boolean) {
+        isVoiceOverlayOpen = open
+        val vs = _uiState.value.voiceState
+        if (open) {
+            val busyWithAudio = vs.isListening || vs.isAwaitingFollowUp || vs.isSpeakingTts || activeTurnJob?.isActive == true
+            if (busyWithAudio) {
+                voiceService?.setOverlayListeningPaused(true)
+            } else {
+                // Keep ambient "Hey Nova" wake-word listening active even when overlay is standing by
+                resumeWakeWordIfIdle()
+            }
+        } else {
+            if (vs.isAwaitingFollowUp && !vs.isSpeakingTts && !vs.useServiceFollowUpMic) {
+                _uiState.update { cur ->
+                    cur.copy(voiceState = cur.voiceState.copy(useServiceFollowUpMic = true))
+                }
+                startServiceFollowUpCapture()
+            } else {
+                resumeWakeWordIfIdle()
+            }
+        }
+    }
+
+    fun requestServiceFollowUpFallback() {
+        val vs = _uiState.value.voiceState
+        if (!vs.isAwaitingFollowUp || vs.isSpeakingTts || vs.useServiceFollowUpMic) return
+        _uiState.update { cur ->
+            cur.copy(voiceState = cur.voiceState.copy(useServiceFollowUpMic = true))
+        }
+        startServiceFollowUpCapture()
+    }
+
+    fun requestServiceOneShotMicCapture() {
+        val svc = voiceService
+        if (svc == null) {
+            _uiState.update { cur ->
+                cur.copy(
+                    voiceState = cur.voiceState.copy(
+                        isListening = false,
+                        orbMode = OrbVisualMode.IDLE,
+                        statusHeader = "TAP MIC OR TYPE REQUEST",
+                        showKeyboardInput = true
+                    )
+                )
+            }
+            return
+        }
+        svc.beginConcurrentMicSession()
+        svc.setOverlayListeningPaused(true)
+        svc.stopSpeakingImmediate()
+        _uiState.update { cur ->
+            cur.copy(
+                voiceState = cur.voiceState.copy(
+                    isListening = true,
+                    orbMode = OrbVisualMode.LISTENING,
+                    statusHeader = "LISTENING...",
+                    isSpeakingTts = false
+                )
+            )
+        }
+        svc.startOneShotCommandCapture(
+            onReady = {
+                _uiState.update { cur ->
+                    cur.copy(
+                        voiceState = cur.voiceState.copy(
+                            isListening = true,
+                            orbMode = OrbVisualMode.LISTENING,
+                            statusHeader = "LISTENING...",
+                            amplitude = 0.35f
+                        )
+                    )
+                }
+            },
+            onPartial = { partial -> updateLiveTranscript(partial, 0.6f) },
+            onRms = { rms -> updateVoiceAmplitude(rms) },
+            onResult = { spoken ->
+                submitCommand(spoken, speakResponse = true)
+            },
+            onErrorFallback = { msg ->
+                svc.endConcurrentMicSession(resumeInterruptedMediaIfNeeded = true)
+                _uiState.update { cur ->
+                    cur.copy(
+                        voiceState = cur.voiceState.copy(
+                            isListening = false,
+                            orbMode = OrbVisualMode.IDLE,
+                            statusHeader = "TAP MIC OR TYPE REQUEST",
+                            showKeyboardInput = true
+                        ),
+                        statusToast = msg
+                    )
+                }
+                resumeWakeWordIfIdle()
+            }
+        )
+    }
+
+    private fun startServiceFollowUpCapture() {
+        val custom = testServiceFollowUpDispatcher
+        if (custom != null) {
+            custom.invoke(followUpListenWindowMs) { spoken ->
+                if (spoken.isNotBlank()) submitCommand(spoken, speakResponse = true)
+            }
+            return
+        }
+        voiceService?.startFollowUpCapture(
+            silenceTimeoutMs = followUpListenWindowMs,
+            onReady = {
+                _uiState.update { cur ->
+                    if (!cur.voiceState.isAwaitingFollowUp) return@update cur
+                    cur.copy(
+                        voiceState = cur.voiceState.copy(
+                            isListening = true,
+                            orbMode = OrbVisualMode.LISTENING,
+                            amplitude = 0.35f
+                        )
+                    )
+                }
+            },
+            onPartial = { partial ->
+                if (_uiState.value.voiceState.isAwaitingFollowUp) {
+                    onFollowUpSpeechStarted()
+                    updateLiveTranscript(partial, 0.6f)
+                }
+            },
+            onRms = { rms ->
+                updateVoiceAmplitude(rms)
+            },
+            onResult = { spoken ->
+                submitCommand(spoken, speakResponse = true)
+            },
+            onNoMatchOrTimeout = {
+                onFollowUpSpeechNoMatch()
+            },
+            onErrorFallback = { msg ->
+                handleFollowUpMicErrorFallback(msg)
+            }
+        )
+    }
+
+    fun handleFollowUpMicErrorFallback(msg: String) {
+        followUpFallbackJob?.cancel()
+        followUpJob?.cancel()
+        voiceService?.stopFollowUpCapture()
+        _uiState.update { cur ->
+            cur.copy(
+                voiceState = cur.voiceState.copy(
+                    isListening = false,
+                    isAwaitingFollowUp = false,
+                    useServiceFollowUpMic = false,
+                    followUpCancelTrigger = System.currentTimeMillis(),
+                    orbMode = OrbVisualMode.IDLE,
+                    statusHeader = "TAP MIC OR TYPE REPLY",
+                    showKeyboardInput = true
+                ),
+                statusToast = msg
+            )
+        }
+        resumeWakeWordIfIdle()
+    }
+
+    fun interruptSpeaking(startListening: Boolean = true) {
+        speechGenerationId++
+        followUpFallbackJob?.cancel()
+        followUpJob?.cancel()
+        activeTurnJob?.cancel()
+        voiceService?.stopFollowUpCapture()
+        voiceService?.stopSpeakingImmediate()
+        llmBridge.sendBargeInAbort()
+        if (startListening) {
+            startFollowUpListenWindow(
+                speakOnTimeout = true,
+                headerOverride = "INTERRUPTED • LISTENING..."
+            )
+        } else {
+            _uiState.update { cur ->
+                cur.copy(
+                    voiceState = cur.voiceState.copy(
+                        isSpeakingTts = false,
+                        isListening = false,
+                        isAwaitingFollowUp = false,
+                        useServiceFollowUpMic = false,
+                        followUpCancelTrigger = System.currentTimeMillis(),
+                        orbMode = OrbVisualMode.IDLE,
+                        statusHeader = "INTERRUPTED • STANDING BY"
+                    )
+                )
+            }
+            resumeWakeWordIfIdle()
+        }
+    }
+
+    fun handleVoiceBargeInDecision(decision: NovaVoiceForegroundService.BargeInDecision) {
+        when (decision.action) {
+            NovaVoiceForegroundService.BargeInAction.STOP_ONLY -> interruptSpeaking(startListening = false)
+            NovaVoiceForegroundService.BargeInAction.LISTEN_NOW -> interruptSpeaking(startListening = true)
+            NovaVoiceForegroundService.BargeInAction.RUN_COMMAND -> {
+                if (decision.command.isNotBlank()) {
+                    submitCommand(decision.command, speakResponse = true)
+                } else {
+                    interruptSpeaking(startListening = true)
+                }
+            }
+        }
+    }
+
+    fun startFollowUpListenWindow(
+        speakOnTimeout: Boolean = true,
+        headerOverride: String? = null
+    ) {
+        followUpFallbackJob?.cancel()
+        followUpJob?.cancel()
+        val now = System.currentTimeMillis()
+        val secs = ((followUpListenWindowMs + 999L) / 1000L).coerceAtLeast(1L)
+        val useServiceMic = !(isAppInForeground && isVoiceOverlayOpen)
+        val headerPrefix = if (headerOverride?.contains("INTERRUPTED", ignoreCase = true) == true) {
+            "INTERRUPTED • LISTENING"
+        } else {
+            "LISTENING FOR REPLY"
+        }
+        _uiState.update { cur ->
+            cur.copy(
+                voiceState = cur.voiceState.copy(
+                    isAwaitingFollowUp = true,
+                    followUpListenTrigger = now,
+                    followUpCancelTrigger = 0L,
+                    orbMode = OrbVisualMode.LISTENING,
+                    isSpeakingTts = false,
+                    useServiceFollowUpMic = useServiceMic,
+                    statusHeader = headerOverride ?: "$headerPrefix (${secs}s)..."
+                )
+            )
+        }
+        voiceService?.setOverlayListeningPaused(true)
+        if (useServiceMic) {
+            startServiceFollowUpCapture()
+        }
+        scheduleFollowUpTimeoutCountdown(speakOnTimeout, headerPrefix)
+    }
+
+    private fun scheduleFollowUpTimeoutCountdown(
+        speakOnTimeout: Boolean,
+        headerPrefix: String = "LISTENING FOR REPLY"
+    ) {
+        followUpJob?.cancel()
+        followUpJob = viewModelScope.launch {
+            val totalMs = followUpListenWindowMs
+            if (totalMs >= 2000L) {
+                var remainingMs = totalMs
+                while (remainingMs > 0L) {
+                    val secs = ((remainingMs + 999L) / 1000L).coerceAtLeast(1L)
+                    _uiState.update { cur ->
+                        if (!cur.voiceState.isAwaitingFollowUp) return@update cur
+                        cur.copy(
+                            voiceState = cur.voiceState.copy(
+                                statusHeader = "$headerPrefix (${secs}s)..."
+                            )
+                        )
+                    }
+                    val step = remainingMs.coerceAtMost(1000L)
+                    kotlinx.coroutines.delay(step)
+                    remainingMs -= step
+                }
+            } else {
+                kotlinx.coroutines.delay(totalMs)
+            }
+            handleFollowUpTimeout(speakOnTimeout)
+        }
+    }
+
+    private fun handleFollowUpTimeout(speakOnTimeout: Boolean) {
+        if (!_uiState.value.voiceState.isAwaitingFollowUp) return
+        voiceService?.stopFollowUpCapture()
+        val timeoutReply = "Let me know what you need."
+        _uiState.update { cur ->
+            cur.copy(
+                voiceState = cur.voiceState.copy(
+                    isListening = false,
+                    isAwaitingFollowUp = false,
+                    useServiceFollowUpMic = false,
+                    followUpCancelTrigger = System.currentTimeMillis(),
+                    orbMode = OrbVisualMode.IDLE,
+                    statusHeader = "STANDING BY",
+                    assistantResponse = timeoutReply,
+                    isSpeakingTts = speakOnTimeout
+                )
+            )
+        }
+        val spoke = if (speakOnTimeout) {
+            dispatchTtsSpeech(timeoutReply) {
+                onTurnTtsCompleted()
+            }
+        } else {
+            false
+        }
+        if (!spoke) {
+            _uiState.update { cur ->
+                cur.copy(voiceState = cur.voiceState.copy(isSpeakingTts = false))
+            }
+            resumeWakeWordIfIdle()
+        }
+    }
+
+    fun onFollowUpSpeechStarted() {
+        followUpJob?.cancel()
+        followUpFallbackJob?.cancel()
+        _uiState.update { cur ->
+            if (!cur.voiceState.isAwaitingFollowUp) return@update cur
+            cur.copy(
+                voiceState = cur.voiceState.copy(
+                    statusHeader = "LISTENING..."
+                )
+            )
+        }
+    }
+
+    fun onFollowUpSpeechNoMatch() {
+        if (!_uiState.value.voiceState.isAwaitingFollowUp) return
+        if (followUpJob?.isActive != true) {
+            scheduleFollowUpTimeoutCountdown(speakOnTimeout = true)
+        }
+    }
+
+    fun cancelFollowUpWindow() {
+        followUpFallbackJob?.cancel()
+        followUpJob?.cancel()
+        voiceService?.stopFollowUpCapture()
+        _uiState.update { cur ->
+            if (!cur.voiceState.isAwaitingFollowUp && !cur.voiceState.useServiceFollowUpMic) return@update cur
+            cur.copy(
+                voiceState = cur.voiceState.copy(
+                    isAwaitingFollowUp = false,
+                    useServiceFollowUpMic = false,
+                    followUpCancelTrigger = System.currentTimeMillis()
+                )
+            )
+        }
+        resumeWakeWordIfIdle()
     }
 
     fun approvePendingTierRed() {
@@ -907,7 +2342,9 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun killSwitchAbort() {
+        cancelFollowUpWindow()
         activeTurnJob?.cancel()
+        voiceService?.stopFollowUpCapture()
         llmBridge.sendBargeInAbort()
         voiceService?.stopSpeakingImmediate()
         NovaAccessibilityService.abortAutomation("Kill switch pressed")
@@ -915,13 +2352,17 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleKillSwitchAbort(reason: String) {
+        cancelFollowUpWindow()
         activeTurnJob?.cancel()
+        voiceService?.stopFollowUpCapture()
         voiceService?.stopSpeakingImmediate()
         _uiState.update { state ->
             state.copy(
                 pendingConfirmation = null,
                 voiceState = state.voiceState.copy(
                     isListening = false,
+                    isAwaitingFollowUp = false,
+                    useServiceFollowUpMic = false,
                     statusHeader = "STOPPED • KILL SWITCH",
                     orbMode = OrbVisualMode.ERROR_ABORTED,
                     assistantResponse = reason,
@@ -958,6 +2399,148 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun openRoutineEditor(routine: RecordedRoutine? = null) {
+        val target = routine ?: RecordedRoutine(
+            name = "My Routine ${_uiState.value.recordedRoutines.size + 1}",
+            description = "Custom automated routine",
+            scope = RoutineScope.GLOBAL
+        )
+        val apps = _uiState.value.installedAppsForRoutines.ifEmpty {
+            AppCapabilityRegistry.discoverInstalledApps(getApplication()).take(40)
+        }
+        _uiState.update {
+            it.copy(
+                editingRoutine = target,
+                installedAppsForRoutines = apps
+            )
+        }
+    }
+
+    fun closeRoutineEditor() {
+        _uiState.update { it.copy(editingRoutine = null) }
+    }
+
+    fun saveRecordedRoutine(routine: RecordedRoutine) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val saved = routineStore.saveRoutine(routine)
+            runCatching {
+                routineStore.syncRoutineIntoFts(saved, ftsHelper, embeddingRuntime)
+            }
+            RoutineRecorderManager.selectPlayRoutine(saved.id)
+            refreshFtsQuery(_uiState.value.ftsSearchQuery)
+            _uiState.update {
+                it.copy(
+                    editingRoutine = null,
+                    statusToast = "Saved routine '${saved.name}' (${saved.steps.size} steps)"
+                )
+            }
+        }
+    }
+
+    fun deleteRecordedRoutine(id: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            routineStore.deleteRoutine(id)
+            runCatching { ftsHelper.deleteDocument("rt_$id") }
+            refreshFtsQuery(_uiState.value.ftsSearchQuery)
+            _uiState.update { cur ->
+                cur.copy(
+                    editingRoutine = if (cur.editingRoutine?.id == id) null else cur.editingRoutine,
+                    statusToast = "Deleted routine"
+                )
+            }
+        }
+    }
+
+    fun runRecordedRoutine(routine: RecordedRoutine, overrideDelayMs: Long? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            RoutineRecorderManager.selectPlayRoutine(routine.id)
+            RoutineRecorderManager.setPlayingState(true, "Running '${routine.name}'...")
+            val engine = RoutineExecutionEngine(getApplication()) { step ->
+                val report = executor.execute(
+                    com.example.data.ToolCallRequest(
+                        toolName = "set_hardware_state",
+                        args = mapOf(
+                            "feature" to step.targetLabel.lowercase().ifBlank { "flashlight" },
+                            "state" to step.textValue.lowercase().ifBlank { "on" }
+                        )
+                    )
+                )
+                report.success to report.summary
+            }
+            val result = engine.executeRoutine(routine, overrideDelayMs)
+            RoutineRecorderManager.setPlayingState(false, result.summary)
+            _uiState.update { it.copy(statusToast = result.summary) }
+        }
+    }
+
+    fun launchFloatingRoutineControl(
+        scope: RoutineScope = RoutineScope.GLOBAL,
+        targetAppName: String? = null,
+        targetPackage: String? = null,
+        autoStartRecording: Boolean = false
+    ) {
+        val app = getApplication<Application>()
+        val accReady = NovaAccessibilityService.instance != null ||
+            NovaAccessibilityService.isServiceEnabledInSystem(app)
+        if (!accReady) {
+            _uiState.update {
+                it.copy(
+                    statusToast = "Enable Nova Accessibility Service in Android Settings to use Floating Routine Control."
+                )
+            }
+            return
+        }
+        RoutineRecorderManager.showFloatingControl(
+            scope = scope,
+            targetAppName = targetAppName,
+            targetPackage = targetPackage,
+            selectedPlayRoutineId = _uiState.value.recordedRoutines.firstOrNull()?.id,
+            autoStartRecording = autoStartRecording
+        )
+        if (scope == RoutineScope.PER_APP && !targetPackage.isNullOrBlank()) {
+            app.packageManager.getLaunchIntentForPackage(targetPackage)?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }?.let { runCatching { app.startActivity(it) } }
+        }
+        _uiState.update {
+            it.copy(
+                statusToast = if (autoStartRecording) {
+                    "Floating recorder started — tap, swipe, or add + IF conditions on screen."
+                } else {
+                    "Floating routine bar active — use ▶ Start or ● Record over any app."
+                }
+            )
+        }
+    }
+
+    fun hideFloatingRoutineControl() {
+        RoutineRecorderManager.hideFloatingControl()
+    }
+
+    fun stopAndSaveFloatingRecording(customName: String? = null) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val saved = RoutineRecorderManager.stopAndSaveRecording(
+                context = getApplication(),
+                routineName = customName,
+                ftsHelper = ftsHelper,
+                embeddingRuntime = embeddingRuntime
+            )
+            routineStore.reload()
+            refreshFtsQuery(_uiState.value.ftsSearchQuery)
+            _uiState.update {
+                it.copy(
+                    editingRoutine = saved ?: it.editingRoutine,
+                    statusToast = saved?.let { rt -> "Saved '${rt.name}' (${rt.steps.size} steps) — customize delays & IF logic below." }
+                        ?: "No steps recorded yet."
+                )
+            }
+        }
+    }
+
+    fun showStatusToast(message: String) {
+        _uiState.update { it.copy(statusToast = message) }
+    }
+
     fun clearStatusToast() {
         _uiState.update { it.copy(statusToast = null) }
     }
@@ -966,14 +2549,45 @@ class NovaViewModel(application: Application) : AndroidViewModel(application) {
         if (isVoiceServiceBound) {
             runCatching { getApplication<Application>().unbindService(fgsConnection) }
         }
+        routineStore.close()
+        ftsHelper.close()
         embeddingRuntime.shutdown()
         llmBridge.unbind()
         super.onCleared()
     }
 
     companion object {
+        const val FOLLOW_UP_TIMEOUT_MS = 10_000L
         private val KEY_USER_NAME = stringPreferencesKey("user_display_name")
+        private val KEY_PERSONALITY = stringPreferencesKey("assistant_personality")
         private val KEY_WAKE_WORD = booleanPreferencesKey("always_on_wake_word")
         private val KEY_PREFER_NPU = booleanPreferencesKey("prefer_npu_backend")
+        private val KEY_PROACTIVE_NOTIF_PROMPTS = booleanPreferencesKey("proactive_notif_prompts")
+        private val KEY_THINKING_ENABLED = booleanPreferencesKey("llm_thinking_enabled")
+        private val KEY_PAUSE_WAKE_DURING_MEDIA = booleanPreferencesKey("pause_wake_during_media")
+        private val KEY_ASR_ENGINE = stringPreferencesKey("selected_asr_engine")
+        private val KEY_TTS_ENGINE = stringPreferencesKey("selected_tts_engine")
+        private val KEY_SYSTEM_TTS_ENGINE_PKG = stringPreferencesKey("selected_system_tts_engine_pkg")
+        private val KEY_SYSTEM_TTS_VOICE_NAME = stringPreferencesKey("selected_system_tts_voice_name")
+        private val KEY_TTS_SPEECH_RATE = floatPreferencesKey("tts_speech_rate")
+        private val KEY_TTS_PITCH = floatPreferencesKey("tts_pitch")
+
+        internal fun isMediaPlaybackStartOutcome(
+            outcome: TurnExecutionOutcome,
+            expectsAnswer: Boolean
+        ): Boolean {
+            if (expectsAnswer || outcome.pendingConfirmation != null) return false
+            val lowerResp = outcome.responseText.lowercase()
+            val failureMarkers = listOf("couldn't", "could not", "failed", "offline", "unavailable", "not installed", "no internet")
+            if (failureMarkers.any { lowerResp.contains(it) }) return false
+            val calledPlayTool = outcome.toolCalls.any { call ->
+                call.toolName == "play_in_app" ||
+                    (call.toolName == "media_control" && call.args["action"]?.lowercase() in setOf("play", "resume", "next", "previous"))
+            }
+            if (calledPlayTool) return true
+            return lowerResp.startsWith("playing ") ||
+                lowerResp.startsWith("resuming ") ||
+                lowerResp.startsWith("now playing ")
+        }
     }
 }

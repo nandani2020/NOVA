@@ -31,6 +31,7 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 class LlmModelMissingException(message: String) : IllegalStateException(message)
+class LlmInferenceException(message: String) : IllegalStateException(message)
 
 /**
  * Process A -> Process B (:llm) IPC Bridge.
@@ -111,10 +112,11 @@ class LlmProcessBridge(
                     val reqId = d.getString(LlmEngineService.KEY_REQUEST_ID).orEmpty()
                     val reason = d.getString(LlmEngineService.KEY_NOTE) ?: "Cancelled"
                     val isMissing = d.getBoolean(LlmEngineService.KEY_MODEL_MISSING, false)
-                    val ex: Throwable = if (isMissing) {
-                        LlmModelMissingException(reason)
-                    } else {
-                        kotlinx.coroutines.CancellationException(reason)
+                    val isError = d.getBoolean(LlmEngineService.KEY_IS_ERROR, false)
+                    val ex: Throwable = when {
+                        isMissing -> LlmModelMissingException(reason)
+                        isError -> LlmInferenceException(reason)
+                        else -> kotlinx.coroutines.CancellationException(reason)
                     }
                     pendingTurns.remove(reqId)?.completeExceptionally(ex)
                 }
@@ -243,17 +245,31 @@ class LlmProcessBridge(
         uiTreeContext: String? = null,
         installedAppsContext: String? = null,
         recordedAccount: String? = null,
-        resetConversation: Boolean = false
+        memoryContext: String? = null,
+        personalityProfile: String? = null,
+        resetConversation: Boolean = false,
+        allowThinking: Boolean = true
     ): RemoteLlmResult {
         val modelFile = modelManager.getActiveModelFile(com.example.data.ModelSlot.LLM)
             ?: throw LlmModelMissingException(
                 "No local LLM installed. Open Settings to download or import Gemma 4 E2B (.litertlm)."
             )
 
-        val messenger = remoteMessenger
-            ?: throw LlmModelMissingException(
+        var messenger = remoteMessenger
+        if (messenger == null) {
+            bindToLlmProcess()
+            var waitedMs = 0L
+            while (remoteMessenger == null && waitedMs < 2_500L) {
+                delay(150L)
+                waitedMs += 150L
+            }
+            messenger = remoteMessenger
+        }
+        if (messenger == null) {
+            throw LlmModelMissingException(
                 "Process B (:llm) is not bound yet. Model '${modelFile.name}' requires the :llm service."
             )
+        }
 
         val reqId = UUID.randomUUID().toString().take(8)
         val deferred = CompletableDeferred<RemoteLlmResult>()
@@ -267,6 +283,7 @@ class LlmProcessBridge(
                 putStringArrayList(LlmEngineService.KEY_SKILLS, ArrayList(candidateSkills))
                 putStringArrayList(LlmEngineService.KEY_FEW_SHOTS, ArrayList(fewShots))
                 putBoolean(LlmEngineService.KEY_RESET_CONVERSATION, resetConversation)
+                putBoolean(LlmEngineService.KEY_ALLOW_THINKING, allowThinking)
                 if (imageBytes != null && imageBytes.isNotEmpty()) {
                     putByteArray(LlmEngineService.KEY_IMAGE_BYTES, imageBytes)
                 }
@@ -279,16 +296,23 @@ class LlmProcessBridge(
                 if (!recordedAccount.isNullOrBlank()) {
                     putString(LlmEngineService.KEY_RECORDED_ACCOUNT, recordedAccount)
                 }
+                if (!memoryContext.isNullOrBlank()) {
+                    putString(LlmEngineService.KEY_MEMORY_CONTEXT, memoryContext)
+                }
+                if (!personalityProfile.isNullOrBlank()) {
+                    putString(LlmEngineService.KEY_PERSONALITY_PROFILE, personalityProfile)
+                }
             }
         }
         runCatching { messenger.send(msg) }.onFailure {
             pendingTurns.remove(reqId)?.completeExceptionally(it)
         }
 
-        return withTimeoutOrNull(30_000L) { deferred.await() }
+        return withTimeoutOrNull(45_000L) { deferred.await() }
             ?: run {
                 pendingTurns.remove(reqId)
-                throw IllegalStateException("Process B (:llm) inference timed out.")
+                sendControlMessage(LlmEngineService.MSG_BARGE_IN_CANCEL)
+                throw LlmInferenceException("Local AI took too long to respond. Please try again.")
             }
     }
 

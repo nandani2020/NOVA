@@ -14,18 +14,71 @@ object InputNormalizer {
         val cleanedFull: String,
         val subCommands: List<String>,
         val hasConditionalLogic: Boolean,
-        val strippedCorrection: Boolean
+        val strippedCorrection: Boolean,
+        val wakeWordStripped: Boolean = false,
+        val isWakeWordOnly: Boolean = false
     )
 
     private val selfCorrectionPrefixes = listOf(
         Regex("^.*?\\b(?:wait no|wait not [^,;]+[,;]?|scratch that[,;]?|no actually[,;]?|sorry i meant)\\s+", RegexOption.IGNORE_CASE)
     )
 
+    private val greetingWakeRegex = Regex(
+        "^(?:uh+|um+|oh+|ah+|excuse\\s+me|hey\\s+there)?[\\s,]*(?:hey|ok|okay|hi|yo|hello|dear|a|eh|ey|ay)[\\s,]+(?:nova|novah|novaa|no\\s*va|noah|noba|nava|nora|nola|novas|nova's)(?:[\\s,.:!?]+(.*))?$",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val compactWakeRegex = Regex(
+        "^(?:heynova|oknova|okaynova|hinova|heynoba|heynava)(?:[\\s,.:!?]+(.*))?$",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val directPunctuatedWakeRegex = Regex(
+        "^(?:nova|novah|novaa|noba)(?:[\\s,.:!?]+(.*))?$",
+        RegexOption.IGNORE_CASE
+    )
+
+    private val nonAssistantNovaPhraseRegex = Regex(
+        "^nova\\s+(?:scotia|launcher|era|baby|award|awards|pro|series)\\b",
+        RegexOption.IGNORE_CASE
+    )
+
     private val conditionalPattern = Regex("\\b(if\\s+.+?\\s+then\\s+.+|whenever\\s+.+|unless\\s+.+)\\b", RegexOption.IGNORE_CASE)
 
+    fun extractAfterWakePhrase(rawInput: String): Pair<String, Boolean> {
+        val trimmed = rawInput.trim()
+        if (trimmed.isEmpty()) return "" to false
+
+        greetingWakeRegex.find(trimmed)?.let { m ->
+            return m.groupValues[1].trim() to true
+        }
+        compactWakeRegex.find(trimmed)?.let { m ->
+            return m.groupValues[1].trim() to true
+        }
+        if (!nonAssistantNovaPhraseRegex.containsMatchIn(trimmed)) {
+            directPunctuatedWakeRegex.find(trimmed)?.let { m ->
+                return m.groupValues[1].trim() to true
+            }
+        }
+        return trimmed to false
+    }
+
     fun normalize(rawInput: String): NormalizedInput {
-        var text = rawInput.trim()
+        val (withoutWake, wakeStripped) = extractAfterWakePhrase(rawInput)
+        var text = withoutWake.trim()
         var stripped = false
+
+        if (wakeStripped && text.isEmpty()) {
+            return NormalizedInput(
+                original = rawInput,
+                cleanedFull = "",
+                subCommands = emptyList(),
+                hasConditionalLogic = false,
+                strippedCorrection = false,
+                wakeWordStripped = true,
+                isWakeWordOnly = true
+            )
+        }
 
         // Normalize common English contractions before matching (Adreno FP16 / regex safety)
         text = normalizeContractions(text)
@@ -63,7 +116,9 @@ object InputNormalizer {
             cleanedFull = text,
             subCommands = commands,
             hasConditionalLogic = hasConditional,
-            strippedCorrection = stripped
+            strippedCorrection = stripped,
+            wakeWordStripped = wakeStripped,
+            isWakeWordOnly = false
         )
     }
 

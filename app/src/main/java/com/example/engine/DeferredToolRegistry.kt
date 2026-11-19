@@ -31,11 +31,21 @@ object DeferredToolRegistry {
 
     fun getAllRegisteredTools(): List<ToolDefinition> = toolsByName.values.toList()
 
+    fun findTool(name: String): ToolDefinition? = toolsByName[name]
+
     fun getToolsForSkills(skillIds: List<String>): List<ToolDefinition> {
-        return skillIds
+        val disclosed = skillIds
             .mapNotNull { SkillCatalog.findById(it) }
-            .flatMap { it.tools }
-            .distinctBy { it.name }
+            .filter { it.enabled }
+        val resolved = buildList {
+            for (skill in disclosed) {
+                addAll(skill.tools)
+                for (companionName in skill.companionTools) {
+                    toolsByName[companionName]?.let { add(it) }
+                }
+            }
+        }
+        return resolved.distinctBy { it.name }
     }
 
     fun validateToolCall(call: ToolCallRequest): ToolCallRequest {
@@ -60,6 +70,21 @@ object DeferredToolRegistry {
             val action = call.args["action"]?.uppercase()
             val textArg = call.args["text"].orEmpty()
             if (action == "CLICK" && (isRedButtonLabel(textArg) || isRedButtonLabel(joinedArgs))) {
+                return SafetyTier.RED
+            }
+            return SafetyTier.GREEN
+        }
+        if (call.toolName == "ui_find_and_tap") {
+            val actionType = call.args["action_type"]?.lowercase() ?: "click"
+            val targetLabel = call.args["target_label"].orEmpty()
+            if (actionType != "type" && (isRedButtonLabel(targetLabel) || isRedButtonLabel(joinedArgs))) {
+                return SafetyTier.RED
+            }
+            return SafetyTier.GREEN
+        }
+        if (call.toolName == "screen_control_app") {
+            val goal = call.args["goal"].orEmpty()
+            if (isRedButtonLabel(goal)) {
                 return SafetyTier.RED
             }
             return SafetyTier.GREEN

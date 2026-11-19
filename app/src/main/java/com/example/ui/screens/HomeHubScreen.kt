@@ -1,13 +1,21 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -28,6 +36,12 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RadioButtonChecked
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.outlined.Apps
 import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.Bluetooth
@@ -36,32 +50,45 @@ import androidx.compose.material.icons.outlined.FlashlightOn
 import androidx.compose.material.icons.outlined.MusicNote
 import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.outlined.Wifi
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import com.example.R
 import com.example.data.ControlIconType
 import com.example.data.HubCategory
 import com.example.data.OrbVisualMode
+import com.example.data.RecordedRoutine
+import com.example.data.RoutineScope
 import com.example.data.SmartControlItem
+import com.example.data.WakeWordStatus
 import com.example.ui.NovaUiState
 import com.example.ui.components.GlassCard
 import com.example.ui.components.NovaStatusPill
@@ -80,6 +107,7 @@ import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 
+@OptIn(ExperimentalLayoutApi::class, ExperimentalFoundationApi::class)
 @Composable
 fun HomeHubScreen(
     uiState: NovaUiState,
@@ -89,6 +117,13 @@ fun HomeHubScreen(
     onRunAppOrRoutineCommand: (String) -> Unit,
     onOpenVoiceOverlay: () -> Unit,
     onOpenSettings: () -> Unit,
+    onEnableWakeWordFromHub: () -> Unit = {},
+    onLaunchFloatingRoutineControl: () -> Unit = {},
+    onStopAndSaveFloatingRecording: () -> Unit = {},
+    onOpenRoutineEditor: (RecordedRoutine?) -> Unit = {},
+    onRunRecordedRoutine: (RecordedRoutine) -> Unit = {},
+    onDeleteRecordedRoutine: (String) -> Unit = {},
+    onOpenHiddenReadme: () -> Unit = {},
     onExitStandMode: () -> Unit,
     modifier: Modifier = Modifier
 ) {
@@ -100,6 +135,16 @@ fun HomeHubScreen(
             modifier = modifier
         )
         return
+    }
+
+    val context = LocalContext.current
+    var routinePendingDelete by remember { mutableStateOf<RecordedRoutine?>(null) }
+    val wakeMicLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            onEnableWakeWordFromHub()
+        }
     }
 
     val filteredControls = remember(uiState.selectedCategory, uiState.controls) {
@@ -137,7 +182,15 @@ fun HomeHubScreen(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .combinedClickable(
+                                onClick = {},
+                                onLongClick = onOpenHiddenReadme
+                            )
+                            .testTag("home_greeting_header")
+                    ) {
                         Text(
                             text = "HI, ${uiState.userName}!",
                             style = MaterialTheme.typography.labelMedium,
@@ -158,12 +211,47 @@ fun HomeHubScreen(
                             else ->
                                 "LLM NOT INSTALLED • REFLEX ONLY" to NovaCoralRed
                         }
-                        NovaStatusPill(
-                            text = statusText,
-                            dotColor = dotColor,
-                            modifier = Modifier.testTag("local_ai_status_pill"),
-                            onClick = onOpenSettings
-                        )
+                        val hasMicPerm = ContextCompat.checkSelfPermission(
+                            context,
+                            Manifest.permission.RECORD_AUDIO
+                        ) == PackageManager.PERMISSION_GRANTED
+                        val (wakePillText, wakePillColor) = when {
+                            uiState.processHealth.wakeWordStatus == WakeWordStatus.UNAVAILABLE ->
+                                "HEY NOVA N/A • TAP MIC" to NovaAmber
+                            !hasMicPerm || uiState.processHealth.wakeWordStatus == WakeWordStatus.MIC_PERMISSION_NEEDED ->
+                                "ENABLE HEY NOVA" to NovaAmber
+                            uiState.processHealth.wakeWordStatus == WakeWordStatus.PAUSED_FOR_MEDIA ->
+                                "WAKE PAUSED • MUSIC" to NovaCyan
+                            uiState.processHealth.wakeWordEnabled ->
+                                "HEY NOVA READY" to NovaEmerald
+                            else ->
+                                "HEY NOVA OFF" to NovaAmber
+                        }
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            NovaStatusPill(
+                                text = statusText,
+                                dotColor = dotColor,
+                                modifier = Modifier.testTag("local_ai_status_pill"),
+                                onClick = onOpenSettings
+                            )
+                            NovaStatusPill(
+                                text = wakePillText,
+                                dotColor = wakePillColor,
+                                modifier = Modifier.testTag("hey_nova_status_pill"),
+                                onClick = {
+                                    if (!hasMicPerm) {
+                                        wakeMicLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                    } else if (!uiState.processHealth.wakeWordEnabled) {
+                                        onEnableWakeWordFromHub()
+                                    } else {
+                                        onOpenVoiceOverlay()
+                                    }
+                                }
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.width(12.dp))
@@ -295,6 +383,38 @@ fun HomeHubScreen(
                 }
             }
 
+            if (uiState.selectedCategory == HubCategory.ROUTINES) {
+                item(span = { GridItemSpan(maxLineSpan) }) {
+                    RoutineRecorderStudioBanner(
+                        uiState = uiState,
+                        onLaunchFloating = onLaunchFloatingRoutineControl,
+                        onStopAndSave = onStopAndSaveFloatingRecording,
+                        onNewRoutine = { onOpenRoutineEditor(null) },
+                        onOpenAccessibilitySettings = {
+                            runCatching {
+                                context.startActivity(
+                                    android.content.Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            }
+                        }
+                    )
+                }
+
+                items(
+                    items = uiState.recordedRoutines,
+                    key = { "recorded_${it.id}" },
+                    span = { GridItemSpan(maxLineSpan) }
+                ) { routine ->
+                    RecordedRoutineHubCard(
+                        routine = routine,
+                        onStart = { onRunRecordedRoutine(routine) },
+                        onEdit = { onOpenRoutineEditor(routine) },
+                        onDelete = { routinePendingDelete = routine }
+                    )
+                }
+            }
+
             // 2-Column Quick Action & Device Grid
             items(filteredControls, key = { it.id }) { item ->
                 DeviceGridTile(
@@ -308,6 +428,260 @@ fun HomeHubScreen(
                         }
                     }
                 )
+            }
+        }
+
+        val toDelete = routinePendingDelete
+        if (toDelete != null) {
+            AlertDialog(
+                onDismissRequest = { routinePendingDelete = null },
+                title = { Text("Delete Routine?") },
+                text = {
+                    Text("Delete \"${toDelete.name}\" and its ${toDelete.steps.size} saved steps? This cannot be undone.")
+                },
+                confirmButton = {
+                    TextButton(
+                        onClick = {
+                            onDeleteRecordedRoutine(toDelete.id)
+                            routinePendingDelete = null
+                        },
+                        modifier = Modifier.testTag("confirm_delete_routine_dialog_btn")
+                    ) {
+                        Text("Delete", color = NovaCoralRed)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { routinePendingDelete = null }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun RoutineRecorderStudioBanner(
+    uiState: NovaUiState,
+    onLaunchFloating: () -> Unit,
+    onStopAndSave: () -> Unit,
+    onNewRoutine: () -> Unit,
+    onOpenAccessibilitySettings: () -> Unit
+) {
+    val rec = uiState.recorderState
+    GlassCard(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("routine_recorder_banner"),
+        cornerRadius = 20.dp,
+        isHighlighted = rec.isRecording || rec.isFloatingVisible
+    ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "ROUTINE RECORDER & STUDIO",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = NovaCyan
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = when {
+                            rec.isRecording -> "Recording (${rec.capturedSteps.size} steps captured)"
+                            rec.isFloatingVisible -> "Floating control pill is active on screen"
+                            else -> "Record taps, swipes, timing & IF conditions"
+                        },
+                        style = MaterialTheme.typography.titleMedium,
+                        color = NovaTextPrimary
+                    )
+                }
+                if (!uiState.processHealth.accessibilityConnected) {
+                    NovaStatusPill(
+                        text = "Accessibility OFF",
+                        dotColor = NovaAmber,
+                        onClick = onOpenAccessibilitySettings
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(12.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (rec.isRecording) {
+                    Button(
+                        onClick = onStopAndSave,
+                        shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NovaEmerald,
+                            contentColor = Color.Black
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("home_save_recording_btn")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Stop,
+                            contentDescription = "Save Recording",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Save Recording", style = MaterialTheme.typography.labelLarge)
+                    }
+                } else {
+                    Button(
+                        onClick = onLaunchFloating,
+                        shape = RoundedCornerShape(999.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NovaCoralRed,
+                            contentColor = Color.White
+                        ),
+                        modifier = Modifier
+                            .weight(1f)
+                            .minimumInteractiveComponentSize()
+                            .testTag("home_floating_routine_btn")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.RadioButtonChecked,
+                            contentDescription = "Open Floating Control",
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Floating Control", style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+
+                OutlinedButton(
+                    onClick = onNewRoutine,
+                    shape = RoundedCornerShape(999.dp),
+                    modifier = Modifier
+                        .weight(1f)
+                        .minimumInteractiveComponentSize()
+                        .testTag("home_new_routine_btn")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Add,
+                        contentDescription = "New Routine",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Routine Studio", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecordedRoutineHubCard(
+    routine: RecordedRoutine,
+    onStart: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit
+) {
+    GlassCard(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("recorded_routine_card_${routine.id}"),
+        cornerRadius = 18.dp,
+        onClick = onEdit
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Text(
+                        text = routine.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        color = NovaTextPrimary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (routine.hasConditionals()) {
+                        Text(
+                            text = "IF/ELSE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = NovaAmber,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(999.dp))
+                                .background(NovaAmber.copy(alpha = 0.16f))
+                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.height(3.dp))
+                Text(
+                    text = routine.summaryLine(),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = if (routine.scope == RoutineScope.PER_APP) NovaLavender else NovaCyan,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = onStart,
+                    shape = RoundedCornerShape(999.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = NovaEmerald,
+                        contentColor = Color.Black
+                    ),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp),
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("run_routine_${routine.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.PlayArrow,
+                        contentDescription = "Start ${routine.name}",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text("Start", style = MaterialTheme.typography.labelMedium)
+                }
+                IconButton(
+                    onClick = onEdit,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("edit_routine_${routine.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Edit,
+                        contentDescription = "Edit ${routine.name}",
+                        tint = NovaTextSecondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                IconButton(
+                    onClick = onDelete,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .testTag("delete_routine_card_${routine.id}")
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Delete,
+                        contentDescription = "Delete ${routine.name}",
+                        tint = NovaCoralRed,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
             }
         }
     }

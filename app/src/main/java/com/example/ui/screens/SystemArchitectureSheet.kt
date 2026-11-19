@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -40,6 +41,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
@@ -71,8 +73,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import com.example.data.AgenticMemoryType
+import com.example.data.AsrEngineOption
+import com.example.data.AssistantPersonality
+import com.example.data.LearnedProcessRecord
 import com.example.data.ModelDownloadState
 import com.example.data.ModelSlot
+import com.example.data.TtsEngineOption
+import com.example.data.WakeWordStatus
 import com.example.engine.SkillCatalog
 import com.example.ui.NovaUiState
 import com.example.ui.components.GlassCard
@@ -107,10 +115,24 @@ fun NovaSettingsSheet(
     onStartModelDownload: (slot: ModelSlot, url: String, fileName: String, token: String) -> Unit,
     onCancelModelDownload: () -> Unit,
     onImportLocalModel: (slot: ModelSlot, Uri, String?) -> Unit,
+    onSelectInstalledModel: (slot: ModelSlot, fileName: String) -> Unit = { _, _ -> },
+    onDeleteSpecificModel: (slot: ModelSlot, fileName: String) -> Unit = { _, _ -> },
     onDeleteModel: (slot: ModelSlot) -> Unit,
     onReloadModel: (slot: ModelSlot) -> Unit,
     onToggleWakeWord: (Boolean) -> Unit,
+    onRecordWakeCalibrationSample: () -> Unit = {},
+    onResetWakeVoiceCalibration: () -> Unit = {},
+    onTogglePauseWakeDuringMedia: (Boolean) -> Unit = {},
+    onSelectAsrEngine: (AsrEngineOption) -> Unit = {},
+    onSelectTtsEngine: (TtsEngineOption) -> Unit = {},
+    onSelectSystemTtsEngine: (String) -> Unit = {},
+    onSelectSystemTtsVoice: (String) -> Unit = {},
+    onSetTtsSpeechRate: (Float) -> Unit = {},
+    onTestSpeakVoice: () -> Unit = {},
+    onRefreshVoices: () -> Unit = {},
+    onToggleProactiveNotifPrompts: (Boolean) -> Unit = {},
     onTogglePreferNpu: (Boolean) -> Unit,
+    onToggleThinking: (Boolean) -> Unit = {},
     onUpdateUserName: (String) -> Unit,
     onSaveDeviceAccount: (String) -> Unit,
     onDetectDeviceAccount: () -> Unit,
@@ -120,14 +142,20 @@ fun NovaSettingsSheet(
     onIndexDocument: (Uri, String?) -> Unit,
     onFtsQueryChange: (String) -> Unit,
     onAddMemoryNote: (String, String) -> Unit,
+    onSelectPersonality: (AssistantPersonality) -> Unit = {},
+    onDeleteAgenticMemory: (String) -> Unit = {},
+    onDeleteLearnedProcess: (String) -> Unit = {},
+    onDeleteLearnedProcessStep: (String, Int) -> Unit = { _, _ -> },
+    onRunLearnedProcess: (LearnedProcessRecord) -> Unit = {},
+    onClearAllAgenticLearning: () -> Unit = {},
+    onOpenHiddenReadme: () -> Unit = {},
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    var devTapCount by remember { mutableStateOf(0) }
     var activeModelTab by remember { mutableStateOf(ModelSlot.LLM) }
-    var llmUrl by remember { mutableStateOf(uiState.llmPreset?.downloadUrl.orEmpty()) }
-    var embUrl by remember { mutableStateOf(uiState.embeddingPreset?.downloadUrl.orEmpty()) }
-    var hfToken by remember { mutableStateOf("") }
+    var pendingImportSlot by remember { mutableStateOf(ModelSlot.LLM) }
 
     var editableName by remember(uiState.userName) { mutableStateOf(uiState.userName) }
     var editableAccount by remember(uiState.recordedAccount) { mutableStateOf(uiState.recordedAccount.orEmpty()) }
@@ -138,10 +166,13 @@ fun NovaSettingsSheet(
     fun queryDisplayName(uri: Uri): String? {
         var name: String? = null
         runCatching {
-            context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { c ->
                 val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
                 if (idx >= 0 && c.moveToFirst()) name = c.getString(idx)
             }
+        }
+        if (name.isNullOrBlank()) {
+            name = uri.lastPathSegment?.substringAfterLast('/')?.substringAfterLast(':')
         }
         return name
     }
@@ -150,8 +181,14 @@ fun NovaSettingsSheet(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
-            onImportLocalModel(activeModelTab, uri, queryDisplayName(uri))
+            onImportLocalModel(pendingImportSlot, uri, queryDisplayName(uri))
         }
+    }
+
+    fun launchImportForSlot(slot: ModelSlot) {
+        activeModelTab = slot
+        pendingImportSlot = slot
+        modelPickerLauncher.launch(arrayOf("*/*"))
     }
 
     val docPickerLauncher = rememberLauncherForActivityResult(
@@ -168,6 +205,12 @@ fun NovaSettingsSheet(
         if (granted) onToggleWakeWord(true)
     }
 
+    val calibrateMicPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) onRecordWakeCalibrationSample()
+    }
+
     val contactsPermLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -175,9 +218,9 @@ fun NovaSettingsSheet(
     }
 
     val calendarPermLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        if (granted) onSyncCalendar()
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { perms ->
+        if (perms[Manifest.permission.READ_CALENDAR] == true) onSyncCalendar()
     }
 
     val btPermLauncher = rememberLauncherForActivityResult(
@@ -217,14 +260,32 @@ fun NovaSettingsSheet(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable {
+                            val next = devTapCount + 1
+                            if (next >= 5) {
+                                devTapCount = 0
+                                onOpenHiddenReadme()
+                            } else {
+                                devTapCount = next
+                            }
+                        }
+                        .testTag("settings_header_secret_trigger")
+                ) {
                     Text(
-                        text = "NOVA SETTINGS",
+                        text = if (devTapCount in 2..4) {
+                            "NOVA SETTINGS • README IN ${5 - devTapCount}"
+                        } else {
+                            "NOVA SETTINGS"
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         color = NovaCyan
                     )
                     Text(
-                        text = "Gemma 4, EmbeddingGemma & OS Access",
+                        text = "Local AI Models, Voice & OS Access",
                         style = MaterialTheme.typography.titleLarge,
                         color = NovaTextPrimary
                     )
@@ -247,243 +308,36 @@ fun NovaSettingsSheet(
                     .padding(horizontal = 18.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                // 1. Local Models Manager (Gemma 4 E2B + EmbeddingGemma 2)
+                // 1. Local Models Manager (Gemma 4, EmbeddingGemma, ASR & TTS Models)
                 item {
-                    val isLlmTab = activeModelTab == ModelSlot.LLM
-                    val isPresent = if (isLlmTab) uiState.processHealth.modelPresent else uiState.processHealth.embeddingPresent
-                    val activeName = if (isLlmTab) uiState.processHealth.activeModelName else uiState.processHealth.activeEmbeddingName
-                    val activeMb = if (isLlmTab) uiState.processHealth.activeModelSizeMb else uiState.processHealth.activeEmbeddingSizeMb
-                    val currentPreset = if (isLlmTab) uiState.llmPreset else uiState.embeddingPreset
-                    val currentUrl = if (isLlmTab) llmUrl else embUrl
+                    LocalModelsManagerCard(
+                        uiState = uiState,
+                        activeModelTab = activeModelTab,
+                        onSelectModelTab = { activeModelTab = it },
+                        onStartModelDownload = onStartModelDownload,
+                        onCancelModelDownload = onCancelModelDownload,
+                        onLaunchModelImport = { slot -> launchImportForSlot(slot) },
+                        onSelectInstalledModel = onSelectInstalledModel,
+                        onDeleteSpecificModel = onDeleteSpecificModel,
+                        onDeleteAllInSlot = onDeleteModel,
+                        onReloadModel = onReloadModel
+                    )
+                }
 
-                    GlassCard(
-                        modifier = Modifier.fillMaxWidth(),
-                        cornerRadius = 20.dp,
-                        isHighlighted = !uiState.processHealth.modelPresent
-                    ) {
-                        Column(modifier = Modifier.padding(16.dp)) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                ModelSlot.entries.forEach { slot ->
-                                    val selected = activeModelTab == slot
-                                    val installed = if (slot == ModelSlot.LLM) {
-                                        uiState.processHealth.modelPresent
-                                    } else {
-                                        uiState.processHealth.embeddingPresent
-                                    }
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .background(if (selected) NovaViolet.copy(alpha = 0.28f) else Color(0x10FFFFFF))
-                                            .border(
-                                                1.dp,
-                                                if (selected) NovaViolet else NovaGlassBorder,
-                                                RoundedCornerShape(12.dp)
-                                            )
-                                            .clickable { activeModelTab = slot }
-                                            .padding(10.dp)
-                                            .testTag("model_tab_${slot.name.lowercase()}")
-                                    ) {
-                                        Column {
-                                            Text(
-                                                text = if (slot == ModelSlot.LLM) "Gemma 4 E2B IT" else "EmbeddingGemma 2",
-                                                style = MaterialTheme.typography.labelLarge,
-                                                color = NovaTextPrimary
-                                            )
-                                            Text(
-                                                text = if (installed) "Installed" else if (slot == ModelSlot.LLM) "Required (~2.58 GB)" else "Tier 1.5 (~165 MB)",
-                                                style = MaterialTheme.typography.labelSmall,
-                                                color = if (installed) NovaEmerald else NovaAmber
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = if (isLlmTab) "CORE LLM (:llm)" else "EMBEDDING ENGINE (Proc A)",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = NovaLavender
-                                )
-                                NovaStatusPill(
-                                    text = if (isPresent) "INSTALLED ($activeMb MB)" else "NOT INSTALLED",
-                                    dotColor = if (isPresent) NovaEmerald else NovaCoralRed
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = when {
-                                    isPresent && isLlmTab ->
-                                        "Active: $activeName • Backend: ${uiState.processHealth.activeLlmBackend} • :llm ${uiState.processHealth.processBStatus}"
-                                    isPresent && !isLlmTab ->
-                                        "Active: $activeName • Engine: ${if (uiState.processHealth.embeddingReady) "READY (CPU)" else "IDLE"}"
-                                    isLlmTab ->
-                                        "Tier 2/3 AI inference is disabled until Gemma 4 E2B (.litertlm) is downloaded or imported."
-                                    else ->
-                                        "Optional for neural Tier 1.5 lookup & hybrid vector search. Download or import EmbeddingGemma 2."
-                                },
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = NovaTextSecondary
-                            )
-
-                            Spacer(modifier = Modifier.height(10.dp))
-
-                            OutlinedTextField(
-                                value = currentUrl,
-                                onValueChange = { if (isLlmTab) llmUrl = it else embUrl = it },
-                                label = { Text("${currentPreset?.displayName ?: "Model"} URL") },
-                                singleLine = true,
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = NovaViolet,
-                                    unfocusedBorderColor = NovaGlassBorder,
-                                    focusedTextColor = NovaTextPrimary,
-                                    unfocusedTextColor = NovaTextPrimary
-                                ),
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .testTag("model_url_input")
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-
-                            OutlinedTextField(
-                                value = hfToken,
-                                onValueChange = { hfToken = it },
-                                label = { Text("Hugging Face Token (optional)") },
-                                singleLine = true,
-                                visualTransformation = PasswordVisualTransformation(),
-                                colors = OutlinedTextFieldDefaults.colors(
-                                    focusedBorderColor = NovaViolet,
-                                    unfocusedBorderColor = NovaGlassBorder,
-                                    focusedTextColor = NovaTextPrimary,
-                                    unfocusedTextColor = NovaTextPrimary
-                                ),
-                                modifier = Modifier.fillMaxWidth()
-                            )
-
-                            Spacer(modifier = Modifier.height(12.dp))
-
-                            when (val dl = uiState.downloadState) {
-                                is ModelDownloadState.Downloading -> {
-                                    val dlMb = dl.bytesDownloaded / (1024L * 1024L)
-                                    val totalMb = if (dl.totalBytes > 0) "${dl.totalBytes / (1024L * 1024L)} MB" else "..."
-                                    Text(
-                                        text = "Downloading ${dl.fileName}: $dlMb MB / $totalMb",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        color = NovaCyan
-                                    )
-                                    Spacer(modifier = Modifier.height(6.dp))
-                                    if (dl.totalBytes > 0) {
-                                        LinearProgressIndicator(
-                                            progress = { dl.progress },
-                                            color = NovaViolet,
-                                            trackColor = Color(0x28FFFFFF),
-                                            modifier = Modifier.fillMaxWidth()
-                                        )
-                                    } else {
-                                        LinearProgressIndicator(
-                                            color = NovaViolet,
-                                            trackColor = Color(0x28FFFFFF),
-                                            modifier = Modifier.fillMaxWidth()
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.height(8.dp))
-                                    OutlinedButton(
-                                        onClick = onCancelModelDownload,
-                                        shape = RoundedCornerShape(999.dp),
-                                        border = androidx.compose.foundation.BorderStroke(1.dp, NovaCoralRed),
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Text("Cancel Download", color = NovaCoralRed)
-                                    }
-                                }
-                                else -> {
-                                    if (dl is ModelDownloadState.Failed) {
-                                        Text(
-                                            text = dl.message,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            color = NovaCoralRed,
-                                            modifier = Modifier.padding(bottom = 8.dp)
-                                        )
-                                    }
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                    ) {
-                                        Button(
-                                            onClick = {
-                                                val fileName = currentPreset?.fileName ?: "model.litertlm"
-                                                onStartModelDownload(activeModelTab, currentUrl, fileName, hfToken)
-                                            },
-                                            shape = RoundedCornerShape(999.dp),
-                                            colors = ButtonDefaults.buttonColors(containerColor = NovaViolet),
-                                            modifier = Modifier
-                                                .weight(1f)
-                                                .testTag("download_llm_button")
-                                        ) {
-                                            Icon(Icons.Filled.CloudDownload, contentDescription = null, modifier = Modifier.size(16.dp))
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text("Download")
-                                        }
-                                        OutlinedButton(
-                                            onClick = { modelPickerLauncher.launch(arrayOf("*/*")) },
-                                            shape = RoundedCornerShape(999.dp),
-                                            border = androidx.compose.foundation.BorderStroke(1.dp, NovaLavender.copy(alpha = 0.5f)),
-                                            modifier = Modifier
-                                                .weight(1f)
-                                                .testTag("import_llm_button")
-                                        ) {
-                                            Icon(Icons.Filled.FolderOpen, contentDescription = null, modifier = Modifier.size(16.dp), tint = NovaLavender)
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text("Import File", color = NovaLavender)
-                                        }
-                                    }
-                                }
-                            }
-
-                            if (isPresent) {
-                                Spacer(modifier = Modifier.height(10.dp))
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    OutlinedButton(
-                                        onClick = { onReloadModel(activeModelTab) },
-                                        shape = RoundedCornerShape(999.dp),
-                                        border = androidx.compose.foundation.BorderStroke(1.dp, NovaCyan.copy(alpha = 0.5f)),
-                                        modifier = Modifier.weight(1f)
-                                    ) {
-                                        Icon(Icons.Filled.Refresh, contentDescription = null, modifier = Modifier.size(16.dp), tint = NovaCyan)
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text(if (isLlmTab) "Reload :llm" else "Reload Emb", color = NovaCyan)
-                                    }
-                                    OutlinedButton(
-                                        onClick = { onDeleteModel(activeModelTab) },
-                                        shape = RoundedCornerShape(999.dp),
-                                        border = androidx.compose.foundation.BorderStroke(1.dp, NovaCoralRed.copy(alpha = 0.6f)),
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .testTag("delete_llm_button")
-                                    ) {
-                                        Icon(Icons.Filled.DeleteOutline, contentDescription = null, modifier = Modifier.size(16.dp), tint = NovaCoralRed)
-                                        Spacer(modifier = Modifier.width(6.dp))
-                                        Text("Delete", color = NovaCoralRed)
-                                    }
-                                }
-                            }
-                        }
-                    }
+                // 1b. Voice, Music Protection, ASR & TTS Engines
+                item {
+                    VoiceAudioEnginesCard(
+                        uiState = uiState,
+                        onTogglePauseWakeDuringMedia = onTogglePauseWakeDuringMedia,
+                        onSelectAsrEngine = onSelectAsrEngine,
+                        onSelectTtsEngine = onSelectTtsEngine,
+                        onSelectSystemTtsEngine = onSelectSystemTtsEngine,
+                        onSelectSystemTtsVoice = onSelectSystemTtsVoice,
+                        onSetTtsSpeechRate = onSetTtsSpeechRate,
+                        onTestSpeakVoice = onTestSpeakVoice,
+                        onRefreshVoices = onRefreshVoices,
+                        onQuickImportSlot = { slot -> launchImportForSlot(slot) }
+                    )
                 }
 
                 // 2. Two-Process Runtime Telemetry & Always-On Wake Word
@@ -556,11 +410,44 @@ fun NovaSettingsSheet(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Column(modifier = Modifier.weight(1f)) {
-                                    Text("Always-On \"Hey Nova\" Wake Word", style = MaterialTheme.typography.titleMedium, color = NovaTextPrimary)
+                                    Text("Deep Thinking Mode (Gemma 4)", style = MaterialTheme.typography.titleMedium, color = NovaTextPrimary)
                                     Text(
-                                        "Continuous foreground listener with automatic TTS barge-in ducking",
+                                        if (uiState.processHealth.thinkingEnabled) {
+                                            "Enabled — uses reasoning tokens for complex planning and UI automation"
+                                        } else {
+                                            "Turned off — faster direct replies with 0 thinking tokens"
+                                        },
                                         style = MaterialTheme.typography.bodyMedium,
                                         color = NovaTextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = uiState.processHealth.thinkingEnabled,
+                                    onCheckedChange = onToggleThinking,
+                                    colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = NovaViolet),
+                                    modifier = Modifier.testTag("thinking_mode_switch")
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(12.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text("Always-On \"Hey Nova\" Wake Word", style = MaterialTheme.typography.titleMedium, color = NovaTextPrimary)
+                                    val wakeSubtitle = when (uiState.processHealth.wakeWordStatus) {
+                                        WakeWordStatus.LISTENING -> "Active — listening hands-free for 'Hey Nova'"
+                                        WakeWordStatus.PAUSED_FOR_OVERLAY -> "Paused while Voice Overlay microphone is open"
+                                        WakeWordStatus.PAUSED_FOR_MEDIA -> "Paused automatically while music/media is playing (resumes when playback stops)"
+                                        WakeWordStatus.MIC_PERMISSION_NEEDED -> "Microphone permission needed to listen for 'Hey Nova'"
+                                        WakeWordStatus.UNAVAILABLE -> "System speech recognizer unavailable on this device — use Voice Overlay or keyboard"
+                                        WakeWordStatus.OFF -> "Continuous foreground listener with automatic TTS barge-in ducking"
+                                    }
+                                    Text(
+                                        text = wakeSubtitle,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = if (uiState.processHealth.wakeWordStatus == WakeWordStatus.LISTENING) NovaEmerald else NovaTextMuted
                                     )
                                 }
                                 Switch(
@@ -577,6 +464,140 @@ fun NovaSettingsSheet(
                                     colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = NovaViolet),
                                     modifier = Modifier.testTag("wake_word_switch")
                                 )
+                            }
+
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(1.dp)
+                                    .background(NovaGlassBorder)
+                            )
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            val calSamples = uiState.processHealth.wakeCalibrationSamples
+                            val calAliases = uiState.processHealth.wakeCalibrationAliases
+                            val isCalibrating = uiState.processHealth.isCalibratingWakeVoice
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Personalize \"Hey Nova\" Voice",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    color = NovaTextPrimary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                NovaStatusPill(
+                                    text = when {
+                                        isCalibrating -> "LISTENING..."
+                                        calSamples >= 3 -> "3/3 CALIBRATED"
+                                        calSamples > 0 -> "$calSamples/3 SAMPLES"
+                                        else -> "0/3 OPTIONAL"
+                                    },
+                                    dotColor = when {
+                                        isCalibrating -> NovaAmber
+                                        calSamples >= 3 -> NovaEmerald
+                                        calSamples > 0 -> NovaCyan
+                                        else -> NovaTextMuted
+                                    }
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Record 3 quick samples of saying \"Hey Nova\" so Nova learns how your phone hears your voice & accent — zero extra battery or RAM.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = NovaTextMuted
+                            )
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Button(
+                                    onClick = {
+                                        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+                                            != PackageManager.PERMISSION_GRANTED
+                                        ) {
+                                            calibrateMicPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                                        } else {
+                                            onRecordWakeCalibrationSample()
+                                        }
+                                    },
+                                    enabled = !isCalibrating,
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isCalibrating) NovaAmber else NovaViolet,
+                                        contentColor = Color.White
+                                    ),
+                                    shape = RoundedCornerShape(14.dp),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                        .testTag("wake_calibrate_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Mic,
+                                        contentDescription = "Record Hey Nova voice sample",
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = when {
+                                            isCalibrating -> "Say \"Hey Nova\" now..."
+                                            calSamples >= 3 -> "Add Extra Sample"
+                                            else -> "Record Sample (${calSamples}/3)"
+                                        },
+                                        style = MaterialTheme.typography.labelLarge
+                                    )
+                                }
+                                if (calSamples > 0 || calAliases.isNotEmpty()) {
+                                    OutlinedButton(
+                                        onClick = onResetWakeVoiceCalibration,
+                                        enabled = !isCalibrating,
+                                        shape = RoundedCornerShape(14.dp),
+                                        modifier = Modifier
+                                            .heightIn(min = 48.dp)
+                                            .testTag("wake_calibrate_reset_button")
+                                    ) {
+                                        Text(
+                                            text = "Reset",
+                                            color = NovaTextSecondary,
+                                            style = MaterialTheme.typography.labelLarge
+                                        )
+                                    }
+                                }
+                            }
+                            if (calAliases.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "Learned voice triggers:",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = NovaTextMuted
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                FlowRow(
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    calAliases.take(6).forEach { alias ->
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(10.dp))
+                                                .background(NovaGlassFill)
+                                                .border(1.dp, NovaGlassBorder, RoundedCornerShape(10.dp))
+                                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                        ) {
+                                            Text(
+                                                text = "\"$alias\"",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = NovaCyan
+                                            )
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -622,6 +643,25 @@ fun NovaSettingsSheet(
                                     Icon(Icons.Filled.Settings, contentDescription = "Accessibility Settings", tint = Color.White)
                                 }
                             }
+                            if (!uiState.processHealth.accessibilityConnected) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Text(
+                                    text = "Enable Nova in Android Accessibility Settings. If greyed out on Android 13+, open App Info -> ⋮ -> Allow restricted settings first.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = NovaTextMuted
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                ActionChip("Open App Info (Restricted Settings)") {
+                                    runCatching {
+                                        context.startActivity(
+                                            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                                data = Uri.parse("package:${context.packageName}")
+                                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                            }
+                                        )
+                                    }
+                                }
+                            }
                             Spacer(modifier = Modifier.height(12.dp))
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -652,6 +692,31 @@ fun NovaSettingsSheet(
                                 ) {
                                     Icon(Icons.Filled.Settings, contentDescription = "Notification Access Settings", tint = Color.White)
                                 }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "Proactive Important Alerts",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = NovaTextPrimary
+                                    )
+                                    Text(
+                                        text = "Prompt aloud & on-screen only for important notifications (messages, missed calls, reminders).",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = NovaTextMuted
+                                    )
+                                }
+                                Switch(
+                                    checked = uiState.processHealth.proactiveNotificationPrompts,
+                                    onCheckedChange = onToggleProactiveNotifPrompts,
+                                    colors = SwitchDefaults.colors(checkedThumbColor = Color.White, checkedTrackColor = NovaViolet),
+                                    modifier = Modifier.testTag("proactive_notif_prompts_switch")
+                                )
                             }
                             Spacer(modifier = Modifier.height(12.dp))
                             FlowRow(
@@ -722,10 +787,12 @@ fun NovaSettingsSheet(
                                     else contactsPermLauncher.launch(Manifest.permission.READ_CONTACTS)
                                 }
                                 ActionChip("Sync Calendar") {
-                                    if (ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALENDAR)
-                                        == PackageManager.PERMISSION_GRANTED
-                                    ) onSyncCalendar()
-                                    else calendarPermLauncher.launch(Manifest.permission.READ_CALENDAR)
+                                    val hasReadCal = ContextCompat.checkSelfPermission(context, Manifest.permission.READ_CALENDAR) == PackageManager.PERMISSION_GRANTED
+                                    val hasWriteCal = ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_CALENDAR) == PackageManager.PERMISSION_GRANTED
+                                    if (hasReadCal && hasWriteCal) onSyncCalendar()
+                                    else calendarPermLauncher.launch(
+                                        arrayOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR)
+                                    )
                                 }
                                 ActionChip("+ PDF / Doc") {
                                     docPickerLauncher.launch(arrayOf("application/pdf", "text/*"))
@@ -933,6 +1000,211 @@ fun NovaSettingsSheet(
                     }
                 }
 
+                // 5.5 Agentic Personality, Learned Preferences & Processes
+                item {
+                    GlassCard(modifier = Modifier.fillMaxWidth(), cornerRadius = 20.dp) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "PERSONALITY & AGENTIC LEARNING",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = NovaLavender
+                                    )
+                                    Text(
+                                        text = "${uiState.processHealth.agenticMemoryCount} memories • ${uiState.processHealth.learnedProcessCount} learned processes",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = NovaTextMuted
+                                    )
+                                }
+                                if (uiState.agenticMemories.isNotEmpty() || uiState.learnedProcesses.isNotEmpty()) {
+                                    ActionChip("Reset Learning", onClick = onClearAllAgenticLearning)
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(10.dp))
+
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                AssistantPersonality.entries.forEach { persona ->
+                                    val selected = uiState.assistantPersonality == persona
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(999.dp))
+                                            .background(if (selected) NovaViolet else NovaGlassFill)
+                                            .border(
+                                                1.dp,
+                                                if (selected) NovaLavender else NovaGlassBorder,
+                                                RoundedCornerShape(999.dp)
+                                            )
+                                            .clickable { onSelectPersonality(persona) }
+                                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                                            .testTag("personality_chip_${persona.name.lowercase()}")
+                                    ) {
+                                        Text(
+                                            text = persona.displayName,
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = if (selected) Color.White else NovaTextSecondary
+                                        )
+                                    }
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = uiState.assistantPersonality.tagline,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = NovaCyan
+                            )
+
+                            if (uiState.learnedProcesses.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    text = "LEARNED WORKFLOWS & HABITS",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = NovaEmerald
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                uiState.learnedProcesses.take(5).forEach { proc ->
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 4.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(Color(0x12FFFFFF))
+                                            .padding(10.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = proc.name,
+                                                    style = MaterialTheme.typography.titleSmall,
+                                                    color = NovaTextPrimary
+                                                )
+                                                Text(
+                                                    text = "${proc.timeBucket.label} • Seen ${proc.executionCount}x • ${(proc.confidence * 100).toInt()}%",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    color = NovaEmerald
+                                                )
+                                            }
+                                            Row(
+                                                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                ActionChip("Run") { onRunLearnedProcess(proc) }
+                                                IconButton(
+                                                    onClick = { onDeleteLearnedProcess(proc.processId) },
+                                                    modifier = Modifier
+                                                        .size(48.dp)
+                                                        .testTag("delete_learned_process_${proc.processId}")
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.DeleteOutline,
+                                                        contentDescription = "Delete learned process ${proc.name}",
+                                                        tint = NovaCoralRed
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        proc.steps.forEachIndexed { stepIdx, stepText ->
+                                            Row(
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .padding(vertical = 2.dp),
+                                                verticalAlignment = Alignment.CenterVertically,
+                                                horizontalArrangement = Arrangement.SpaceBetween
+                                            ) {
+                                                Text(
+                                                    text = "${stepIdx + 1}. $stepText",
+                                                    style = MaterialTheme.typography.bodySmall,
+                                                    color = NovaTextSecondary,
+                                                    modifier = Modifier.weight(1f)
+                                                )
+                                                IconButton(
+                                                    onClick = { onDeleteLearnedProcessStep(proc.processId, stepIdx) },
+                                                    modifier = Modifier
+                                                        .size(40.dp)
+                                                        .testTag("delete_learned_step_${proc.processId}_$stepIdx")
+                                                ) {
+                                                    Icon(
+                                                        imageVector = Icons.Filled.Close,
+                                                        contentDescription = "Delete step ${stepIdx + 1}",
+                                                        tint = NovaCoralRed,
+                                                        modifier = Modifier.size(16.dp)
+                                                    )
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (uiState.agenticMemories.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(12.dp))
+                                Text(
+                                    text = "LEARNED PREFERENCES, CORRECTIONS & EPISODES",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = NovaCyan
+                                )
+                                Spacer(modifier = Modifier.height(6.dp))
+                                uiState.agenticMemories.take(6).forEach { mem ->
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(vertical = 3.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .background(Color(0x0EFFFFFF))
+                                            .padding(10.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Column(modifier = Modifier.weight(1f)) {
+                                            val tagColor = when (mem.memoryType) {
+                                                AgenticMemoryType.CORRECTION -> NovaAmber
+                                                AgenticMemoryType.PREFERENCE -> NovaEmerald
+                                                AgenticMemoryType.EPISODE -> NovaLavender
+                                                AgenticMemoryType.FACT -> NovaCyan
+                                            }
+                                            Text(
+                                                text = "${mem.memoryType.label.uppercase()} • ${mem.topic}",
+                                                style = MaterialTheme.typography.labelSmall,
+                                                color = tagColor
+                                            )
+                                            Spacer(modifier = Modifier.height(2.dp))
+                                            Text(
+                                                text = mem.content,
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = NovaTextPrimary
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        IconButton(
+                                            onClick = { onDeleteAgenticMemory(mem.memoryId) },
+                                            modifier = Modifier.size(48.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.DeleteOutline,
+                                                contentDescription = "Forget learned memory",
+                                                tint = NovaCoralRed
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // 6. Skills Catalog (showing Smart Home DISABLED)
                 item {
                     Text(
@@ -951,11 +1223,18 @@ fun NovaSettingsSheet(
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = skill.id,
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = if (skill.enabled) NovaLavender else NovaTextMuted
-                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = skill.title,
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = if (skill.enabled) NovaTextPrimary else NovaTextMuted
+                                    )
+                                    Text(
+                                        text = "${skill.id} • ${skill.category.title}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (skill.enabled) NovaLavender else NovaTextMuted
+                                    )
+                                }
                                 val (tierLabel, tierColor) = if (!skill.enabled) {
                                     "DISABLED" to NovaTextMuted
                                 } else when (skill.safetyTier.name) {
@@ -965,14 +1244,30 @@ fun NovaSettingsSheet(
                                 }
                                 Text(tierLabel, style = MaterialTheme.typography.labelSmall, color = tierColor)
                             }
-                            Spacer(modifier = Modifier.height(4.dp))
+                            Spacer(modifier = Modifier.height(6.dp))
                             Text(skill.description, style = MaterialTheme.typography.bodyMedium, color = NovaTextSecondary)
+                            if (skill.guidance.isNotBlank()) {
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = skill.guidance,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = NovaTextMuted
+                                )
+                            }
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
                                 text = "Tools: " + skill.tools.joinToString { "${it.name}(${it.parameters.size} args)" },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = if (skill.enabled) NovaCyan else NovaTextMuted
                             )
+                            if (skill.companionTools.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(2.dp))
+                                Text(
+                                    text = "Companions: ${skill.companionTools.joinToString(", ")}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = NovaLavender
+                                )
+                            }
                         }
                     }
                 }

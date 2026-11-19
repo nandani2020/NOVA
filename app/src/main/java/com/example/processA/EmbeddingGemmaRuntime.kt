@@ -35,6 +35,7 @@ class EmbeddingGemmaRuntime(
     private val dispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
     private val mutex = Mutex()
 
+    @Volatile
     private var engine: EmbeddingEngine? = null
     private var loadedPath: String? = null
 
@@ -55,6 +56,7 @@ class EmbeddingGemmaRuntime(
                 return@withLock false
             }
             if (engine != null && loadedPath == file.absolutePath && _isReady.value) {
+                activeProcessInstance = this@EmbeddingGemmaRuntime
                 return@withLock true
             }
             releaseInternal()
@@ -70,6 +72,7 @@ class EmbeddingGemmaRuntime(
                 loadedPath = file.absolutePath
                 _isReady.value = true
                 _lastError.value = null
+                activeProcessInstance = this@EmbeddingGemmaRuntime
                 true
             } catch (ex: Exception) {
                 Log.w(TAG, "EmbeddingGemma initialize failed: ${ex.message}")
@@ -80,13 +83,70 @@ class EmbeddingGemmaRuntime(
         }
     }
 
-    suspend fun embedQuery(query: String): FloatArray? =
-        embedRaw("task: search query | text: $query")
+    suspend fun embedQuery(query: String): FloatArray? {
+        if (query.isBlank()) return null
+        return embedRaw(formatQueryPrompt(query))
+    }
 
-    suspend fun embedDocument(title: String, body: String): FloatArray? =
-        embedRaw("title: $title | text: $body")
+    suspend fun embedDocument(title: String, body: String): FloatArray? {
+        if (title.isBlank() && body.isBlank()) return null
+        return embedRaw(formatDocumentPrompt(title, body))
+    }
+
+    suspend fun embedDocumentsBatch(
+        items: List<Pair<String, String>>,
+        chunkSize: Int = 16
+    ): List<FloatArray?> = withContext(dispatcher) {
+        if (items.isEmpty()) return@withContext emptyList()
+        if (!isModelFilePresent()) {
+            releaseInternal()
+            return@withContext List(items.size) { null }
+        }
+        if (!_isReady.value || engine == null) {
+            val ok = warmup()
+            if (!ok) return@withContext List(items.size) { null }
+        }
+        mutex.withLock {
+            val active = engine ?: return@withLock List(items.size) { null }
+            val results = MutableList<FloatArray?>(items.size) { null }
+            val safeChunk = chunkSize.coerceIn(1, 32)
+            var offset = 0
+            while (offset < items.size) {
+                val end = minOf(offset + safeChunk, items.size)
+                val slice = items.subList(offset, end)
+                val batchInputs = slice.map { (title, body) ->
+                    listOf(InputData.Text(formatDocumentPrompt(title, body)))
+                }
+                val batchResp = runCatching {
+                    active.computeEmbeddingBatch(batchInputs, EmbeddingOptions(normalize = true))
+                }.onFailure {
+                    Log.w(TAG, "computeEmbeddingBatch failed: ${it.message}")
+                }.getOrNull()
+
+                if (batchResp != null && batchResp.size == slice.size) {
+                    batchResp.forEachIndexed { idx, resp ->
+                        results[offset + idx] = normalizeL2(resp.embedding)
+                    }
+                } else {
+                    slice.forEachIndexed { idx, (title, body) ->
+                        val single = runCatching {
+                            val resp = active.computeEmbedding(
+                                listOf(InputData.Text(formatDocumentPrompt(title, body))),
+                                EmbeddingOptions(normalize = true)
+                            )
+                            normalizeL2(resp.embedding)
+                        }.getOrNull()
+                        results[offset + idx] = single
+                    }
+                }
+                offset = end
+            }
+            results
+        }
+    }
 
     suspend fun embedRaw(formattedText: String): FloatArray? = withContext(dispatcher) {
+        if (formattedText.isBlank()) return@withContext null
         if (!isModelFilePresent()) {
             releaseInternal()
             return@withContext null
@@ -120,6 +180,9 @@ class EmbeddingGemmaRuntime(
         engine = null
         loadedPath = null
         _isReady.value = false
+        if (activeProcessInstance === this) {
+            activeProcessInstance = null
+        }
     }
 
     fun shutdown() {
@@ -129,6 +192,25 @@ class EmbeddingGemmaRuntime(
 
     companion object {
         private const val TAG = "EmbeddingGemmaRuntime"
+
+        @Volatile
+        var activeProcessInstance: EmbeddingGemmaRuntime? = null
+            private set
+
+        /**
+         * Official EmbeddingGemma 2 SearchQuery instruction prefix (`task: search result | query: ...`).
+         */
+        fun formatQueryPrompt(query: String): String =
+            "task: search result | query: ${query.trim()}"
+
+        /**
+         * Official EmbeddingGemma 2 Document passage format (`title: {title | none} | text: {content}`).
+         */
+        fun formatDocumentPrompt(title: String, body: String): String {
+            val cleanTitle = title.trim().ifEmpty { "none" }
+            val cleanBody = body.trim()
+            return "title: $cleanTitle | text: $cleanBody"
+        }
 
         fun normalizeL2(vec: FloatArray): FloatArray {
             var sum = 0f
